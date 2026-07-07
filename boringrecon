@@ -629,6 +629,16 @@ for line in read_lines(os.path.join(BASE, "scans/nuclei.txt")):
     url = line.split()[-1] if line.split() else ""
     vulns.append({"template":parts[0] if parts else "","severity":parts[2] if len(parts)>2 else "","url":url})
 
+# Parse subdomain takeover results
+takeovers = {}
+for line in read_lines(os.path.join(BASE, "subdomains/takeover.txt")):
+    if 'VULNERABLE' in line.upper():
+        parts = line.split()
+        for p in parts:
+            if '.' in p and not p.startswith('['):
+                takeovers[p.lower()] = line.strip()
+                break
+
 # Build D3 tree: {name, children[], urls[], path}
 endpoints = read_lines(os.path.join(BASE, "crawl/endpoints.txt"))
 
@@ -703,7 +713,8 @@ data = json.dumps({
     "paramsUrls":read_lines(os.path.join(BASE,"crawl/params.txt")),
     "jsFiles":read_lines(os.path.join(BASE,"crawl/js_files.txt")),
     "screenshots":screenshots,
-    "urlSources":url_sources
+    "urlSources":url_sources,
+    "takeovers":takeovers
 })
 
 HTML = r'''<!DOCTYPE html>
@@ -766,6 +777,7 @@ svg{display:block}
 #search-box input{padding:6px 10px;border:1px solid #e0e0e0;border-radius:6px;font-family:inherit;font-size:0.9em;width:220px;background:#fff}
 #search-box input:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,0.15)}
 .vuln-item{padding:6px 8px;border:1px solid #fca5a5;border-radius:6px;margin-bottom:6px;background:#fff;font-size:0.85em}
+.takeover-alert{padding:6px 10px;border:1px solid #fca5a5;border-radius:6px;background:#fef2f2;color:#991b1b;font-size:0.85em;margin:8px 0;font-weight:600}
 .src-badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:0.7em;font-weight:600;margin-left:4px;vertical-align:middle}
 .src-katana{background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd}
 .src-feroxbuster{background:#dcfce7;color:#166534;border:1px solid #86efac}
@@ -1106,6 +1118,10 @@ function selectNode(n) {
       html += hi.tech.split(',').map(t => `<span class="chip">${t.trim()}</span>`).join(' ');
     }
   }
+
+  // Subdomain takeover
+  const toHost = (() => { try { return new URL(hostKey).hostname; } catch(e) { return (hostKey||'').toLowerCase(); } })();
+  if (D.takeovers[toHost]) html += `<div class="takeover-alert">VULNERABLE — Subdomain Takeover</div>`;
 
   // Vulns scoped to this host/path
   const nodeVulns = D.vulns.filter(v => {
