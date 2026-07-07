@@ -1,0 +1,1176 @@
+#!/bin/bash
+
+# Colors
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+CYAN="\e[36m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+banner() {
+    echo -e "${CYAN}"
+    echo "  ╔╗ ╔═╗╦═╗╦╔╗╔╔═╗"
+    echo "  ╠╩╗║ ║╠╦╝║║║║║ ╦"
+    echo "  ╚═╝╚═╝╩╚═╩╝╚╝╚═╝ recon"
+    echo -e "${RESET}"
+}
+
+usage() {
+    echo -e "${CYAN}boringrecon${RESET} — automated web recon with interactive report"
+    echo
+    echo -e "${BOLD}Usage:${RESET} boringrecon [options] <domain|URL>"
+    echo
+    echo -e "${BOLD}Options:${RESET}"
+    echo "  -q               Quick mode (top-100 nmap, skip subdomain enum)"
+    echo "  -H <value|file>  Add custom HTTP header (repeatable)"
+    echo "                     boringrecon -H 'Cookie: session=abc123' target"
+    echo "                     boringrecon -H /path/to/headers.txt target"
+    echo "  -h               Show this help"
+    echo
+    echo -e "${BOLD}Examples:${RESET}"
+    echo "  boringrecon example.com              Full scan on a domain"
+    echo "  boringrecon -q http://10.10.11.5      Quick scan on an IP"
+    echo "  boringrecon -H cookies.txt -q target  Quick scan with auth cookies"
+    echo
+    echo -e "${BOLD}Output:${RESET}  Results saved to ./<target>/"
+    echo "  report.html       Interactive tree-map report (open in browser)"
+    echo "  crawl/             Endpoints, params, JS files"
+    echo "  scans/             Nmap, nuclei, vhost results"
+    echo "  screenshots/       Full-page screenshots"
+    echo "  subdomains/        Alive hosts, httpx fingerprints"
+    echo
+    echo -e "${BOLD}Pipeline:${RESET}"
+    echo "  httpx → katana → nuclei → gowitness → ffuf (vhosts) → nmap"
+    echo "  Discovered vhosts are automatically re-scanned through the pipeline."
+    exit 1
+}
+
+log() { echo -e "${GREEN}[+]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[!]${RESET} $1"; }
+err() { echo -e "${RED}[-]${RESET} $1"; }
+info() { echo -e "${BLUE}[*]${RESET} $1"; }
+
+check_tool() {
+    if ! command -v "$1" &>/dev/null; then
+        warn "$1 not found — skipping"
+        return 1
+    fi
+    return 0
+}
+
+# Parse args
+QUICK=false
+HEADERS=()
+
+while getopts "qhH:" opt; do
+    case $opt in
+        q) QUICK=true ;;
+        h) usage ;;
+        H)
+            if [ -f "$OPTARG" ]; then
+                while IFS= read -r line; do
+                    [ -n "$line" ] && [[ ! "$line" =~ ^# ]] && HEADERS+=("$line")
+                done < "$OPTARG"
+            else
+                HEADERS+=("$OPTARG")
+            fi
+            ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+INPUT="$1"
+[ -z "$INPUT" ] && usage
+
+# Detect if input is a URL (direct target mode) or a domain (subdomain enum mode)
+URL_MODE=false
+if [[ "$INPUT" =~ ^https?:// ]]; then
+    URL_MODE=true
+    TARGET_URL="${INPUT%/}"
+    DIRNAME=$(echo "$INPUT" | sed 's|https\?://||;s|[/:.]|_|g;s|_$||')
+    # Extract hostname/IP for nmap (strip scheme, path, port)
+    NMAP_TARGET=$(echo "$INPUT" | sed 's|https\?://||;s|[:/].*||')
+else
+    DOMAIN="$INPUT"
+    DIRNAME="$DOMAIN"
+fi
+
+# Build tool-specific header args
+HTTPX_HEADERS=()
+KATANA_HEADERS=()
+NUCLEI_HEADERS=()
+GOWITNESS_HEADERS=()
+FFUF_HEADERS=()
+for h in "${HEADERS[@]}"; do
+    HTTPX_HEADERS+=(-H "$h")
+    KATANA_HEADERS+=(-H "$h")
+    NUCLEI_HEADERS+=(-H "$h")
+    GOWITNESS_HEADERS+=(--chrome-header "$h")
+    FFUF_HEADERS+=(-H "$h")
+done
+
+banner
+info "Target: $INPUT"
+$QUICK && info "Quick mode enabled"
+$URL_MODE && info "URL mode: skipping subdomain enumeration"
+[ ${#HEADERS[@]} -gt 0 ] && info "Custom headers: ${#HEADERS[@]} header(s) loaded"
+
+# Setup directories
+BASE="./$DIRNAME"
+mkdir -p "$BASE"/{subdomains,screenshots,scans,crawl}
+
+ALIVE="$BASE/subdomains/alive.txt"
+HTTPX_FULL="$BASE/subdomains/httpx.txt"
+SUBS_CLEAN="$BASE/subdomains/found.txt"
+PHASE=1
+
+if $URL_MODE; then
+    echo "$TARGET_URL" > "$ALIVE"
+    echo "$NMAP_TARGET" > "$SUBS_CLEAN"
+
+    log "Phase $PHASE: Fingerprinting target"
+    if check_tool httpx; then
+        httpx -l "$ALIVE" -silent \
+            -status-code -title -tech-detect -content-length \
+            -follow-redirects \
+            "${HTTPX_HEADERS[@]}" \
+            -o "$HTTPX_FULL" 2>/dev/null
+    fi
+elif $QUICK; then
+    echo "$DOMAIN" > "$SUBS_CLEAN"
+
+    log "Phase $PHASE: Fingerprinting target (quick — skipping subdomain enum)"
+    if check_tool httpx; then
+        httpx -l "$SUBS_CLEAN" -silent \
+            -status-code -title -tech-detect -content-length \
+            -follow-redirects \
+            "${HTTPX_HEADERS[@]}" \
+            -o "$HTTPX_FULL" 2>/dev/null
+
+        awk '{print $1}' "$HTTPX_FULL" > "$ALIVE"
+    else
+        cp "$SUBS_CLEAN" "$ALIVE"
+    fi
+else
+    log "Phase $PHASE: Subdomain Enumeration"
+
+    SUBS_RAW="$BASE/subdomains/raw.txt"
+    > "$SUBS_RAW"
+
+    if check_tool subfinder; then
+        info "Running subfinder..."
+        subfinder -d "$DOMAIN" -silent >> "$SUBS_RAW" &
+    fi
+
+    if check_tool assetfinder; then
+        info "Running assetfinder..."
+        assetfinder --subs-only "$DOMAIN" >> "$SUBS_RAW" &
+    fi
+
+    wait
+    log "Subdomain enumeration complete"
+
+    ((PHASE++))
+    log "Phase $PHASE: Deduplication"
+
+    sort -u "$SUBS_RAW" | grep -F ".$DOMAIN" | grep -v '^\*' > "$SUBS_CLEAN"
+    echo "$DOMAIN" >> "$SUBS_CLEAN"
+    sort -u -o "$SUBS_CLEAN" "$SUBS_CLEAN"
+
+    TOTAL=$(wc -l < "$SUBS_CLEAN")
+    log "Found $TOTAL unique subdomains"
+
+    if [ "$TOTAL" -eq 0 ]; then
+        err "No subdomains found. Adding base domain only."
+        echo "$DOMAIN" > "$SUBS_CLEAN"
+    fi
+
+    ((PHASE++))
+    log "Phase $PHASE: Alive check & fingerprinting with httpx"
+
+    if check_tool httpx; then
+        httpx -l "$SUBS_CLEAN" -silent \
+            -status-code -title -tech-detect -content-length \
+            -follow-redirects \
+            "${HTTPX_HEADERS[@]}" \
+            -o "$HTTPX_FULL" 2>/dev/null
+
+        awk '{print $1}' "$HTTPX_FULL" > "$ALIVE"
+
+        ALIVE_COUNT=$(wc -l < "$ALIVE")
+        log "$ALIVE_COUNT alive hosts found"
+    else
+        err "httpx not found — cannot continue alive check"
+        cp "$SUBS_CLEAN" "$ALIVE"
+    fi
+fi
+
+if [ ! -s "$ALIVE" ]; then
+    err "No alive hosts. Nothing to do."
+    exit 1
+fi
+
+# ============================================================
+# Scanning phase (parallel)
+# ============================================================
+((PHASE++))
+log "Phase $PHASE: Scanning (parallel)"
+
+# --- Subdomain Takeover Check (domain mode only) ---
+if ! $URL_MODE && check_tool subzy; then
+    info "Checking subdomain takeover..."
+    subzy run --targets "$SUBS_CLEAN" --hide_fails \
+        > "$BASE/subdomains/takeover.txt" 2>/dev/null &
+fi
+
+# --- Screenshots (root/alive only — subfolder screenshots happen after crawl) ---
+if check_tool gowitness; then
+    info "Taking screenshots..."
+    gowitness scan file -f "$ALIVE" \
+        --screenshot-path "$BASE/screenshots" \
+        --write-db=false \
+        "${GOWITNESS_HEADERS[@]}" 2>/dev/null &
+fi
+
+# --- Port Scan (use hostname, not URL) ---
+if check_tool nmap; then
+    info "Port scanning..."
+    if $QUICK; then
+        nmap -T4 --top-ports 100 -oN "$BASE/scans/nmap_quick.txt" \
+            -iL "$SUBS_CLEAN" > /dev/null 2>&1 &
+    else
+        nmap -T4 -sC -sV --top-ports 1000 -oN "$BASE/scans/nmap_full.txt" \
+            -iL "$SUBS_CLEAN" > /dev/null 2>&1 &
+    fi
+fi
+
+# --- Crawl with Katana ---
+if check_tool katana; then
+    info "Crawling with katana..."
+    katana -list "$ALIVE" -silent \
+        -depth 3 -js-crawl -known-files all \
+        -crawl-out-scope '.*logout.*' \
+        "${KATANA_HEADERS[@]}" \
+        -output "$BASE/crawl/raw_endpoints.txt" 2>/dev/null &
+fi
+
+# --- Nuclei ---
+if check_tool nuclei; then
+    info "Running nuclei..."
+    nuclei -l "$ALIVE" -silent \
+        -severity low,medium,high,critical \
+        "${NUCLEI_HEADERS[@]}" \
+        -o "$BASE/scans/nuclei.txt" 2>/dev/null &
+fi
+
+# --- Vhost Enumeration with ffuf ---
+if check_tool ffuf; then
+    if $URL_MODE; then
+        VHOST_HOST=$(echo "$TARGET_URL" | sed 's|https\?://||;s|[:/].*||')
+        VHOST_SCHEME=$(echo "$TARGET_URL" | grep -o '^https\?')
+        VHOST_PORT=$(echo "$TARGET_URL" | sed -n 's|https\?://[^:/]*:\([0-9]*\).*|\1|p')
+    else
+        VHOST_HOST="$DOMAIN"
+        VHOST_SCHEME="http"
+        VHOST_PORT=""
+    fi
+
+    if $QUICK; then
+        VHOST_WL="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+    else
+        VHOST_WL="/usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt"
+    fi
+
+    if [ -f "$VHOST_WL" ]; then
+        info "Vhost enumeration with ffuf..."
+        VHOST_URL="${VHOST_SCHEME}://${VHOST_HOST}${VHOST_PORT:+:$VHOST_PORT}"
+        ffuf -w "$VHOST_WL" \
+            -u "$VHOST_URL" \
+            -H "Host: FUZZ.${VHOST_HOST}" \
+            -ac -mc all -fc 400 \
+            "${FFUF_HEADERS[@]}" \
+            -o "$BASE/scans/vhosts.json" \
+            -of json 2>/dev/null &
+    else
+        warn "Vhost wordlist not found: $VHOST_WL"
+    fi
+fi
+
+info "Waiting for scans to complete..."
+wait
+
+# --- Extract discovered vhosts ---
+if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
+    jq -r '.results[]?.input.FUZZ // empty' "$BASE/scans/vhosts.json" 2>/dev/null \
+        | sort -u | while read -r vhost; do
+            echo "${vhost}.${VHOST_HOST}"
+        done > "$BASE/subdomains/vhosts.txt"
+    VHOST_COUNT=$(wc -l < "$BASE/subdomains/vhosts.txt" 2>/dev/null || echo 0)
+    if [ "$VHOST_COUNT" -gt 0 ]; then
+        log "Found $VHOST_COUNT vhost(s)"
+        cat "$BASE/subdomains/vhosts.txt"
+
+        # Add discovered vhosts to alive list and scan them
+        while read -r vh; do
+            echo "${VHOST_SCHEME}://${vh}${VHOST_PORT:+:$VHOST_PORT}" >> "$ALIVE"
+            echo "$vh" >> "$SUBS_CLEAN"
+        done < "$BASE/subdomains/vhosts.txt"
+        sort -u -o "$ALIVE" "$ALIVE"
+        sort -u -o "$SUBS_CLEAN" "$SUBS_CLEAN"
+
+        ((PHASE++))
+        log "Phase $PHASE: Scanning discovered vhosts"
+
+        VHOST_ALIVE="$BASE/subdomains/vhosts_alive.txt"
+        while read -r vh; do
+            echo "${VHOST_SCHEME}://${vh}${VHOST_PORT:+:$VHOST_PORT}"
+        done < "$BASE/subdomains/vhosts.txt" > "$VHOST_ALIVE"
+
+        if check_tool httpx; then
+            httpx -l "$VHOST_ALIVE" -silent \
+                -status-code -title -tech-detect -content-length \
+                -follow-redirects \
+                "${HTTPX_HEADERS[@]}" 2>/dev/null >> "$HTTPX_FULL" &
+        fi
+        if check_tool katana; then
+            info "Crawling vhosts..."
+            katana -list "$VHOST_ALIVE" -silent \
+                -depth 3 -js-crawl -known-files all \
+                -crawl-out-scope '.*logout.*' \
+                "${KATANA_HEADERS[@]}" \
+                >> "$BASE/crawl/raw_endpoints.txt" 2>/dev/null &
+        fi
+        if check_tool nuclei; then
+            info "Scanning vhosts with nuclei..."
+            nuclei -l "$VHOST_ALIVE" -silent \
+                -severity low,medium,high,critical \
+                "${NUCLEI_HEADERS[@]}" \
+                >> "$BASE/scans/nuclei.txt" 2>/dev/null &
+        fi
+        if check_tool gowitness; then
+            info "Screenshotting vhosts..."
+            gowitness scan file -f "$VHOST_ALIVE" \
+                --screenshot-path "$BASE/screenshots" \
+                --write-db=false \
+                "${GOWITNESS_HEADERS[@]}" 2>/dev/null &
+        fi
+        info "Waiting for vhost scans..."
+        wait
+    fi
+fi
+
+# Ensure all alive hosts appear in endpoints even if katana found nothing
+cat "$ALIVE" >> "$BASE/crawl/raw_endpoints.txt" 2>/dev/null
+touch "$BASE/crawl/raw_endpoints.txt"
+
+# ============================================================
+# Post-processing: deduplicate crawl results
+# ============================================================
+if [ -s "$BASE/crawl/raw_endpoints.txt" ]; then
+    ((PHASE++))
+    log "Phase $PHASE: Processing crawl results"
+
+    # Determine target scope for filtering (strip scheme + trailing slash)
+    SCOPE_PATTERNS=()
+    if $URL_MODE; then
+        SCOPE_PATTERNS+=("$(echo "$TARGET_URL" | sed 's|/$||')")
+        # Include discovered vhosts in scope
+        if [ -s "$BASE/subdomains/vhosts.txt" ]; then
+            while read -r vh; do
+                SCOPE_PATTERNS+=("${vh}")
+            done < "$BASE/subdomains/vhosts.txt"
+        fi
+    else
+        SCOPE_PATTERNS+=("$DOMAIN")
+    fi
+
+    # Deduplicate endpoints, keep only in-scope (match any scope pattern)
+    SCOPE_GREP=$(printf '%s\n' "${SCOPE_PATTERNS[@]}")
+    grep -F -f <(echo "$SCOPE_GREP") "$BASE/crawl/raw_endpoints.txt" | sort -u > "$BASE/crawl/endpoints.txt"
+    ENDPOINTS=$(wc -l < "$BASE/crawl/endpoints.txt")
+    info "$ENDPOINTS unique in-scope endpoints"
+
+    # Extract URLs with query parameters
+    grep '?' "$BASE/crawl/endpoints.txt" | sort -u > "$BASE/crawl/params.txt"
+    PARAMS=$(wc -l < "$BASE/crawl/params.txt")
+    info "$PARAMS URLs with parameters found"
+
+    # Extract unique parameter names
+    grep -oP '[?&]\K[^=]+' "$BASE/crawl/params.txt" | sort -u > "$BASE/crawl/param_names.txt"
+
+    # Extract JS files (in-scope only)
+    grep -iE '\.js(\?|$)' "$BASE/crawl/endpoints.txt" | sort -u > "$BASE/crawl/js_files.txt"
+    JS_COUNT=$(wc -l < "$BASE/crawl/js_files.txt")
+    info "$JS_COUNT unique JS files found"
+
+    # ============================================================
+    # Screenshots of discovered paths (deduped, no params)
+    # ============================================================
+    if check_tool gowitness; then
+        log "Taking screenshots of discovered pages..."
+        # Strip query params, strip static assets, deduplicate
+        sed 's|?.*||' "$BASE/crawl/endpoints.txt" \
+            | grep -viE '\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map)$' \
+            | sort -u \
+            > "$BASE/crawl/screenshot_urls.txt"
+
+        SCREENSHOT_COUNT=$(wc -l < "$BASE/crawl/screenshot_urls.txt")
+        info "Screenshotting $SCREENSHOT_COUNT unique pages..."
+
+        gowitness scan file -f "$BASE/crawl/screenshot_urls.txt" \
+            --screenshot-path "$BASE/screenshots" \
+            --write-db=false \
+            "${GOWITNESS_HEADERS[@]}" 2>/dev/null
+
+        TAKEN=$(ls -1 "$BASE/screenshots/" 2>/dev/null | wc -l)
+        log "$TAKEN screenshots saved"
+    fi
+fi
+
+# ============================================================
+# Final cleanup: deduplicate and sort all output files
+# ============================================================
+for f in \
+    "$BASE/subdomains/alive.txt" \
+    "$BASE/subdomains/found.txt" \
+    "$BASE/subdomains/httpx.txt" \
+    "$BASE/crawl/endpoints.txt" \
+    "$BASE/crawl/params.txt" \
+    "$BASE/crawl/param_names.txt" \
+    "$BASE/crawl/js_files.txt" \
+    "$BASE/crawl/screenshot_urls.txt" \
+    "$BASE/scans/nuclei.txt"; do
+    [ -s "$f" ] && sort -u -o "$f" "$f"
+done
+
+# ============================================================
+# Summary
+# ============================================================
+echo ""
+echo -e "${CYAN}═══════════════════════════════════════${RESET}"
+echo -e "${CYAN}         BORING SUMMARY: $INPUT${RESET}"
+echo -e "${CYAN}═══════════════════════════════════════${RESET}"
+
+if ! $URL_MODE; then
+    [ -f "$SUBS_CLEAN" ] && echo -e "  Subdomains:     $(wc -l < "$SUBS_CLEAN")"
+fi
+[ -f "$ALIVE" ] && echo -e "  Alive hosts:    $(wc -l < "$ALIVE")"
+[ -f "$BASE/crawl/endpoints.txt" ] && echo -e "  Endpoints:      $(wc -l < "$BASE/crawl/endpoints.txt")"
+[ -f "$BASE/crawl/params.txt" ] && echo -e "  Parameterized:  $(wc -l < "$BASE/crawl/params.txt")"
+[ -f "$BASE/crawl/js_files.txt" ] && echo -e "  JS files:       $(wc -l < "$BASE/crawl/js_files.txt")"
+
+SCREENSHOT_TOTAL=$(ls -1 "$BASE/screenshots/" 2>/dev/null | wc -l)
+[ "$SCREENSHOT_TOTAL" -gt 0 ] && echo -e "  Screenshots:    $SCREENSHOT_TOTAL"
+
+if [ -s "$BASE/scans/nuclei.txt" ]; then
+    VULN_COUNT=$(wc -l < "$BASE/scans/nuclei.txt")
+    echo -e "  ${RED}Nuclei findings: $VULN_COUNT${RESET}"
+fi
+
+if [ -s "$BASE/subdomains/takeover.txt" ]; then
+    TAKEOVER_COUNT=$(grep -c "VULNERABLE" "$BASE/subdomains/takeover.txt" 2>/dev/null || true)
+    TAKEOVER_COUNT=${TAKEOVER_COUNT:-0}
+    [ "$TAKEOVER_COUNT" -gt 0 ] && echo -e "  ${RED}Takeover vulns:  $TAKEOVER_COUNT${RESET}"
+fi
+
+echo -e "${CYAN}═══════════════════════════════════════${RESET}"
+echo -e "  Results saved to: ${BLUE}$BASE/${RESET}"
+echo ""
+
+# ============================================================
+# Generate HTML Report — Interactive visual sitemap
+# ============================================================
+generate_report() {
+    local BASE="$1"
+    local TARGET="$2"
+    local REPORT="$BASE/report.html"
+
+    log "Generating interactive report..."
+
+    python3 - "$BASE" "$TARGET" "$REPORT" << 'PYEOF'
+import json, sys, os, subprocess, base64, re
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timezone
+
+BASE, TARGET, REPORT = sys.argv[1], sys.argv[2], sys.argv[3]
+DATE = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+def read_lines(p):
+    try: return [l.strip() for l in open(p) if l.strip()]
+    except FileNotFoundError: return []
+
+# Parse httpx
+httpx = []
+ansi_re = re.compile(r'\x1b\[[0-9;]*m')
+for line in read_lines(os.path.join(BASE, "subdomains/httpx.txt")):
+    line = ansi_re.sub('', line)
+    parts = re.findall(r'\[([^\]]*)\]', line)
+    url = line.split()[0] if line.split() else ""
+    httpx.append({"url":url, "status":parts[0] if parts else "",
+        "length":parts[1] if len(parts)>1 else "", "title":parts[2] if len(parts)>2 else "",
+        "tech":parts[3] if len(parts)>3 else ""})
+
+# Parse nmap
+ports = {}
+nf = os.path.join(BASE,"scans/nmap_full.txt")
+if not os.path.exists(nf): nf = os.path.join(BASE,"scans/nmap_quick.txt")
+host = ""
+for line in read_lines(nf):
+    m = re.match(r'Nmap scan report for (.+)', line)
+    if m: host = m.group(1); ports[host] = []
+    m2 = re.match(r'(\d+/\w+)\s+(\w+)\s+(\S+)', line)
+    if m2 and host: ports[host].append({"port":m2.group(1),"state":m2.group(2),"service":m2.group(3)})
+
+# Parse nuclei
+vulns = []
+for line in read_lines(os.path.join(BASE, "scans/nuclei.txt")):
+    line = ansi_re.sub('', line)
+    parts = re.findall(r'\[([^\]]*)\]', line)
+    url = line.split()[-1] if line.split() else ""
+    vulns.append({"template":parts[0] if parts else "","severity":parts[2] if len(parts)>2 else "","url":url})
+
+# Build D3 tree: {name, children[], urls[], path}
+endpoints = read_lines(os.path.join(BASE, "crawl/endpoints.txt"))
+
+def build_d3_tree(urls, target, alive_hosts):
+    from collections import defaultdict
+    root = {"name": target, "children": {}, "urls": [], "path": "/"}
+
+    host_urls = defaultdict(list)
+    for raw in urls:
+        p = urlparse(raw)
+        host_urls[f"{p.scheme}://{p.netloc}"].append(raw)
+    for h in alive_hosts:
+        if h and h not in host_urls:
+            host_urls[h] = []
+
+    def add_url(node, raw, path_prefix=""):
+        parsed = urlparse(raw)
+        path = parsed.path.strip("/")
+        segs = path.split("/") if path else []
+        cur = node
+        for i, seg in enumerate(segs):
+            cp = (path_prefix + "/" if path_prefix else "") + "/".join(segs[:i+1])
+            if seg not in cur["children"]:
+                cur["children"][seg] = {"name":seg, "children":{}, "urls":[], "path":cp}
+            cur = cur["children"][seg]
+        cur["urls"].append({"url":raw, "params":dict(parse_qs(parsed.query))})
+
+    if len(host_urls) > 1:
+        for hk in sorted(host_urls):
+            netloc = urlparse(hk).netloc
+            hn = {"name": hk, "children": {}, "urls": [], "path": netloc}
+            for raw in host_urls[hk]:
+                add_url(hn, raw, netloc)
+            root["children"][hk] = hn
+    else:
+        for raw in urls:
+            add_url(root, raw)
+
+    def to_list(n):
+        ch = sorted(n["children"].values(), key=lambda x: x["name"])
+        return {"name":n["name"], "path":n["path"], "urls":n["urls"],
+                "children":[to_list(c) for c in ch]}
+    return to_list(root)
+
+tree = build_d3_tree(endpoints, TARGET, read_lines(os.path.join(BASE, "subdomains/alive.txt")))
+
+# Screenshots — just collect filenames, reference originals via relative path
+screenshots = {}
+ss_dir = os.path.join(BASE, "screenshots")
+if os.path.isdir(ss_dir):
+    for fname in sorted(os.listdir(ss_dir)):
+        if not fname.endswith((".jpeg",".jpg")): continue
+        screenshots[fname] = True
+
+data = json.dumps({
+    "target":TARGET, "date":DATE, "alive":read_lines(os.path.join(BASE,"subdomains/alive.txt")),
+    "httpx":httpx, "ports":ports, "vulns":vulns, "tree":tree,
+    "endpointCount":len(endpoints),
+    "paramNames":read_lines(os.path.join(BASE,"crawl/param_names.txt")),
+    "paramsUrls":read_lines(os.path.join(BASE,"crawl/params.txt")),
+    "jsFiles":read_lines(os.path.join(BASE,"crawl/js_files.txt")),
+    "screenshots":screenshots
+})
+
+HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recon Map</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'SF Mono','Fira Code',Consolas,monospace;background:#fff;color:#1a1a1a;font-size:13px;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+#top-bar{display:flex;align-items:center;gap:16px;padding:8px 16px;border-bottom:1px solid #e0e0e0;flex-shrink:0;background:#fafafa}
+#top-bar h1{font-size:1.1em;white-space:nowrap}
+.stat{background:#f1f5f9;border:1px solid #e0e0e0;border-radius:6px;padding:4px 12px;font-size:0.85em;white-space:nowrap}
+.stat b{font-size:1.1em;margin-right:4px}
+.stat.vuln{border-color:#fca5a5;background:#fef2f2}
+.stat.vuln b{color:#dc2626}
+.chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:0.75em;background:#f1f5f9;border:1px solid #e0e0e0;margin:1px}
+.sev{padding:2px 8px;border-radius:4px;font-size:0.75em;font-weight:700;color:#fff}
+.sev-critical{background:#dc2626}.sev-high{background:#ea580c}.sev-medium{background:#ca8a04;color:#1a1a1a}.sev-low{background:#2563eb}
+#main{display:flex;flex:1;overflow:hidden}
+#canvas-wrap{flex:1;position:relative;overflow:hidden;cursor:grab}
+#canvas-wrap.grabbing{cursor:grabbing}
+#canvas{position:absolute;top:0;left:0}
+svg{display:block}
+.link{fill:none;stroke:#cbd5e1;stroke-width:1.5px}
+.node{cursor:pointer}
+.node circle{fill:#fff;stroke:#94a3b8;stroke-width:2px;transition:all 0.15s}
+.node:hover circle{stroke:#2563eb;stroke-width:2.5px}
+.node.has-children circle{fill:#eff6ff;stroke:#60a5fa}
+.node.has-vuln circle{fill:#fef2f2;stroke:#f87171;stroke-width:2.5px}
+.node.selected circle{fill:#dbeafe;stroke:#2563eb;stroke-width:3px}
+.node text{font:11px 'SF Mono','Fira Code',Consolas,monospace;fill:#334155;pointer-events:none}
+.node .count{font-size:9px;fill:#94a3b8}
+.node .indicator{font-size:10px;fill:#94a3b8;pointer-events:none}
+.node:hover .indicator{fill:#2563eb}
+.link.highlight{stroke:#2563eb;stroke-width:2.5px}
+@keyframes node-pulse{0%,100%{stroke-width:2px}50%{stroke-width:5px;stroke:#2563eb}}
+.node.pulse circle{animation:node-pulse 0.3s ease}
+#panel{width:380px;border-left:1px solid #e0e0e0;overflow-y:auto;flex-shrink:0;padding:16px;display:none;background:#fafafa}
+#panel.show{display:block}
+#panel h2{font-size:1em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #e0e0e0}
+#panel h3{font-size:0.9em;margin:12px 0 6px;color:#64748b}
+.panel-url{font-size:0.85em;padding:3px 0;word-break:break-all}
+.panel-url a{color:#2563eb;text-decoration:none}
+.panel-url a:hover{text-decoration:underline}
+.panel-screenshot{width:100%;border:1px solid #e0e0e0;border-radius:6px;margin:4px 0;cursor:pointer}
+.panel-screenshot:hover{border-color:#2563eb}
+.port-chip{display:inline-block;padding:2px 6px;border-radius:4px;font-size:0.75em;margin:2px;background:#dcfce7;border:1px solid #86efac}
+#lightbox{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.88);display:none;align-items:center;justify-content:center;z-index:1000;flex-direction:column}
+#lightbox.show{display:flex}
+#lightbox img{max-width:92vw;max-height:90vh;border-radius:4px}
+#lightbox .lb-close{position:absolute;top:16px;right:24px;font-size:2em;color:#fff;cursor:pointer}
+#lightbox .lb-url{color:#94a3b8;margin-top:8px;font-size:0.85em;max-width:90vw;text-align:center;word-break:break-all}
+#controls{position:absolute;bottom:16px;right:16px;display:flex;gap:6px;z-index:10}
+#controls button{background:#fff;border:1px solid #e0e0e0;border-radius:6px;width:32px;height:32px;cursor:pointer;font-size:1.1em;display:flex;align-items:center;justify-content:center}
+#controls button:hover{background:#f1f5f9;border-color:#94a3b8}
+#search-box{position:absolute;top:12px;left:12px;z-index:10}
+#search-box input{padding:6px 10px;border:1px solid #e0e0e0;border-radius:6px;font-family:inherit;font-size:0.9em;width:220px;background:#fff}
+#search-box input:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,0.15)}
+.vuln-item{padding:6px 8px;border:1px solid #fca5a5;border-radius:6px;margin-bottom:6px;background:#fff;font-size:0.85em}
+</style>
+</head>
+<body>
+<div id="top-bar">
+  <h1 id="title"></h1>
+  <div id="stats"></div>
+  <span style="color:#94a3b8;font-size:0.8em" id="date"></span>
+</div>
+<div id="main">
+  <div id="canvas-wrap">
+    <div id="search-box"><input type="text" id="search" placeholder="Search endpoints..."></div>
+    <div id="canvas"></div>
+    <div id="controls">
+      <button onclick="zoomBy(1.3)" title="Zoom in">+</button>
+      <button onclick="zoomBy(0.7)" title="Zoom out">-</button>
+      <button onclick="resetView()" title="Reset view">R</button>
+      <button onclick="expandAll()" title="Expand all">E</button>
+      <button onclick="collapseAll()" title="Collapse all">C</button>
+    </div>
+  </div>
+  <div id="panel">
+    <h2 id="panel-title"></h2>
+    <div id="panel-content"></div>
+  </div>
+</div>
+<div id="lightbox">
+  <span class="lb-close">&times;</span>
+  <img id="lb-img" src="">
+  <div class="lb-url" id="lb-url"></div>
+</div>
+<script>
+const D = __REPORT_DATA__;
+
+// Top bar
+document.getElementById('title').textContent = D.target;
+document.getElementById('date').textContent = D.date;
+const tp = Object.values(D.ports).reduce((s,p) => s+p.filter(x=>x.state==='open').length, 0);
+let statsHtml = `<span class="stat"><b>${D.alive.length}</b>hosts</span>`;
+statsHtml += `<span class="stat"><b>${D.endpointCount}</b>endpoints</span>`;
+statsHtml += `<span class="stat"><b>${tp}</b>ports</span>`;
+statsHtml += `<span class="stat"><b>${D.paramNames.length}</b>params</span>`;
+if (D.vulns.length) statsHtml += `<span class="stat vuln"><b>${D.vulns.length}</b>vulns</span>`;
+document.getElementById('stats').innerHTML = statsHtml;
+// Build per-host httpx lookup
+const hostInfo = {};
+D.httpx.forEach(h => {
+  try { const host = new URL(h.url).hostname; hostInfo[host] = h; } catch(e) {}
+});
+
+// Screenshot matching
+function urlToSsKey(url) {
+  let u = url.replace(/\?.*$/,'').replace(/\/$/,'');
+  try {
+    const p = new URL(u);
+    const port = p.port || (p.protocol==='https:'?'443':'80');
+    const path = p.pathname.replace(/\/$/,'').replace(/\//g,'-');
+    return p.protocol.replace(':','') + '---' + p.hostname + '-' + port + path + '.jpeg';
+  } catch(e) {
+    return u.replace(/:\/\//,'---').replace(/[\/:]/g,'-') + '.jpeg';
+  }
+}
+
+// D3-like tree layout (no D3 dependency — pure vanilla)
+const wrap = document.getElementById('canvas-wrap');
+const W = wrap.clientWidth, H = wrap.clientHeight;
+
+// Convert tree data to nodes/links with positions
+let allNodes = [], allLinks = [], nodeMap = {};
+let nextId = 0;
+
+function initNode(d, parent, depth) {
+  d._id = nextId++;
+  d._depth = depth;
+  d._parent = parent;
+  d._collapsed = depth > 1;
+  d._x = 0; d._y = 0;
+  d._hasChildren = d.children && d.children.length > 0;
+  d._hasVuln = D.vulns.some(v => v.url.includes('/' + d.path));
+  nodeMap[d._id] = d;
+  if (d.children) d.children.forEach(c => initNode(c, d, depth + 1));
+}
+initNode(D.tree, null, 0);
+
+function getVisible(node) {
+  let nodes = [node];
+  if (!node._collapsed && node.children) {
+    node.children.forEach(c => { nodes = nodes.concat(getVisible(c)); });
+  }
+  return nodes;
+}
+
+function layoutSubtree(node, x, nextY) {
+  const hSpacing = 200, vSpacing = 32;
+  node._x = x;
+  if (node._collapsed || !node.children || !node.children.length) {
+    node._y = nextY;
+    return nextY + vSpacing;
+  }
+  node.children.forEach(ch => {
+    nextY = layoutSubtree(ch, x + hSpacing, nextY);
+  });
+  node._y = (node.children[0]._y + node.children[node.children.length - 1]._y) / 2;
+  return nextY;
+}
+
+function layout() {
+  allNodes = getVisible(D.tree);
+  allLinks = [];
+  layoutSubtree(D.tree, 60, 40);
+  allNodes.forEach(n => {
+    if (n._parent && allNodes.includes(n._parent)) {
+      allLinks.push({ source: n._parent, target: n });
+    }
+  });
+}
+
+// SVG rendering
+let svg, transform = { x: 0, y: 0, k: 1 };
+let selectedNode = null;
+let animFrame = null, nodeEls = {}, linkEls = [];
+
+function render(animate) {
+  if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
+  const oldPos = {};
+  allNodes.forEach(n => { oldPos[n._id] = { x: n._x, y: n._y }; });
+
+  layout();
+
+  const targetPos = {};
+  allNodes.forEach(n => { targetPos[n._id] = { x: n._x, y: n._y }; });
+
+  const svgEl = document.getElementById('canvas');
+  svgEl.innerHTML = '';
+  nodeEls = {};
+  linkEls = [];
+
+  svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', W * 3);
+  svg.setAttribute('height', Math.max(H, allNodes.length * 36 + 100));
+  svgEl.appendChild(svg);
+
+  const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  g.id = 'zoom-group';
+  svg.appendChild(g);
+
+  // Links
+  allLinks.forEach(l => {
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('class', 'link');
+    g.appendChild(path);
+    linkEls.push({ path, source: l.source, target: l.target });
+  });
+
+  // Nodes
+  allNodes.forEach(n => {
+    const ng = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    let cls = 'node';
+    if (n._hasChildren) cls += ' has-children';
+    if (n._hasVuln) cls += ' has-vuln';
+    if (selectedNode && selectedNode._id === n._id) cls += ' selected';
+    ng.setAttribute('class', cls);
+    ng.style.opacity = (searchActive && !n._searchMatch) ? '0.12' : '1';
+
+    if (n._hasChildren) {
+      const ind = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      ind.setAttribute('class', 'indicator');
+      ind.setAttribute('x', -14);
+      ind.setAttribute('y', 4);
+      ind.style.cursor = 'pointer';
+      ind.textContent = n._collapsed ? '▶' : '▼';
+      ind.addEventListener('click', (e) => {
+        e.stopPropagation();
+        n._collapsed = !n._collapsed;
+        render(true);
+        selectNode(n);
+      });
+      ng.appendChild(ind);
+    }
+
+    const r = n._hasChildren ? 8 : 5;
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('r', r);
+    ng.appendChild(circle);
+
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('x', r + 6);
+    text.setAttribute('y', 4);
+    let label = n._depth === 0 ? n.name : '/' + n.name;
+    if (label.length > 28) label = label.slice(0, 26) + '..';
+    text.textContent = label;
+    ng.appendChild(text);
+
+    const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+    title.textContent = n._depth === 0 ? n.name : '/' + n.path;
+    ng.appendChild(title);
+
+    if (n._hasChildren) {
+      const cnt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      cnt.setAttribute('class', 'count');
+      cnt.setAttribute('x', r + 6 + label.length * 6.5 + 4);
+      cnt.setAttribute('y', 4);
+      const total = countAll(n);
+      cnt.textContent = n._collapsed ? `(+${total})` : `(${total})`;
+      ng.appendChild(cnt);
+    }
+
+    let didDrag = false;
+    ng.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (didDrag) { didDrag = false; return; }
+      selectNode(n);
+    });
+    ng.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      if (n._hasChildren) {
+        n._collapsed = !n._collapsed;
+        render(true);
+      }
+    });
+
+    // Drag support
+    let dragStart = null, origX, origY;
+    ng.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      didDrag = false;
+      dragStart = { x: e.clientX, y: e.clientY };
+      origX = n._x; origY = n._y;
+      const onMove = (me) => {
+        const dx = me.clientX - dragStart.x, dy = me.clientY - dragStart.y;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
+        n._x = origX + dx / transform.k;
+        n._y = origY + dy / transform.k;
+        ng.setAttribute('transform', `translate(${n._x},${n._y})`);
+        updateLinks();
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+
+    nodeEls[n._id] = ng;
+    g.appendChild(ng);
+  });
+
+  if (animate && Object.keys(oldPos).length) {
+    allNodes.forEach(n => {
+      const p = oldPos[n._id] || (n._parent ? (oldPos[n._parent._id] || targetPos[n._parent._id]) : targetPos[n._id]);
+      n._x = p.x; n._y = p.y;
+    });
+    positionAll();
+    const start = performance.now();
+    function step(now) {
+      let t = Math.min(1, (now - start) / 300);
+      t = t < 0.5 ? 2*t*t : -1+(4-2*t)*t;
+      allNodes.forEach(n => {
+        const o = oldPos[n._id] || (n._parent ? (oldPos[n._parent._id] || targetPos[n._parent._id]) : targetPos[n._id]);
+        const tgt = targetPos[n._id];
+        n._x = o.x + (tgt.x - o.x) * t;
+        n._y = o.y + (tgt.y - o.y) * t;
+      });
+      positionAll();
+      if (t < 1) animFrame = requestAnimationFrame(step);
+      else animFrame = null;
+    }
+    animFrame = requestAnimationFrame(step);
+  } else {
+    positionAll();
+  }
+
+  applyTransform();
+}
+
+function countAll(n) {
+  let c = (n.urls || []).length;
+  if (n.children) n.children.forEach(ch => c += countAll(ch));
+  return c;
+}
+
+function positionAll() {
+  allNodes.forEach(n => {
+    const el = nodeEls[n._id];
+    if (el) el.setAttribute('transform', `translate(${n._x},${n._y})`);
+  });
+  linkEls.forEach(l => {
+    const mx = (l.source._x + l.target._x) / 2;
+    l.path.setAttribute('d', `M${l.source._x},${l.source._y} C${mx},${l.source._y} ${mx},${l.target._y} ${l.target._x},${l.target._y}`);
+  });
+}
+
+function updateLinks() {
+  linkEls.forEach(l => {
+    const mx = (l.source._x + l.target._x) / 2;
+    l.path.setAttribute('d', `M${l.source._x},${l.source._y} C${mx},${l.source._y} ${mx},${l.target._y} ${l.target._x},${l.target._y}`);
+  });
+}
+
+function highlightPath(n) {
+  const pathIds = new Set();
+  let cur = n;
+  while (cur) { pathIds.add(cur._id); cur = cur._parent; }
+  linkEls.forEach(l => {
+    if (pathIds.has(l.source._id) && pathIds.has(l.target._id)) l.path.classList.add('highlight');
+    else l.path.classList.remove('highlight');
+  });
+}
+
+// Side panel
+function selectNode(n) {
+  selectedNode = n;
+  const panel = document.getElementById('panel');
+  const title = document.getElementById('panel-title');
+  const content = document.getElementById('panel-content');
+  panel.classList.add('show');
+
+  const fullPath = n._depth === 0 ? n.name : D.target + '/' + n.path;
+  title.textContent = n._depth === 0 ? n.name : '/' + n.path;
+
+  let html = '';
+
+  // Per-host tech stack & title (host nodes or root in single-host mode)
+  const hostKey = n._depth === 0 ? (D.httpx[0]||{}).url : n.path;
+  const hi = hostKey ? hostInfo[(() => { try { return new URL(hostKey).hostname; } catch(e) { return hostKey; } })()] : null;
+  if (hi) {
+    if (hi.title) html += `<div style="color:#64748b;margin-bottom:8px">${hi.title}</div>`;
+    if (hi.tech) {
+      html += '<h3>Tech Stack</h3>';
+      html += hi.tech.split(',').map(t => `<span class="chip">${t.trim()}</span>`).join(' ');
+    }
+  }
+
+  // Vulns scoped to this host/path
+  const nodeVulns = D.vulns.filter(v => {
+    if (n._depth === 0) return true;
+    try { const vh = new URL(v.url).hostname; return n.path === vh || v.url.includes('/' + n.path); } catch(e) { return v.url.includes('/' + n.path); }
+  });
+  if (nodeVulns.length) {
+    html += '<h3>Vulnerabilities</h3>';
+    nodeVulns.forEach(v => {
+      const s = (v.severity||'info').toLowerCase();
+      html += `<div class="vuln-item"><span class="sev sev-${s}">${v.severity}</span> <b>${v.template}</b><br><a href="${v.url}" target="_blank">${v.url}</a></div>`;
+    });
+  }
+
+  // Ports (root node)
+  if (n._depth === 0 && Object.keys(D.ports).length) {
+    html += '<h3>Open Ports</h3>';
+    Object.entries(D.ports).forEach(([host, ps]) => {
+      html += `<div style="margin-bottom:6px"><b>${host}</b><br>`;
+      ps.forEach(p => { html += `<span class="port-chip">${p.port} ${p.service}</span>`; });
+      html += '</div>';
+    });
+  }
+
+  // URLs at this node
+  const urls = n.urls || [];
+  if (urls.length) {
+    html += `<h3>URLs (${urls.length})</h3>`;
+    urls.forEach(u => {
+      html += `<div class="panel-url"><a href="${u.url}" target="_blank">${u.url}</a>`;
+      const pkeys = Object.keys(u.params||{});
+      if (pkeys.length) html += ' ' + pkeys.map(p => `<span class="chip" style="background:#fef3c7;border-color:#fcd34d">${p}</span>`).join('');
+      html += '</div>';
+      const ssKey = urlToSsKey(u.url);
+      if (D.screenshots[ssKey]) {
+        html += `<img class="panel-screenshot" src="screenshots/${ssKey}" onclick="openLB(this.src,'${u.url.replace(/'/g,"\\'")}')" loading="lazy">`;
+      }
+    });
+  }
+
+  // Child screenshots (if this is a folder node)
+  if (n.children && n.children.length) {
+    const childUrls = [];
+    function collectUrls(node) {
+      (node.urls||[]).forEach(u => childUrls.push(u));
+      (node.children||[]).forEach(c => collectUrls(c));
+    }
+    n.children.forEach(c => collectUrls(c));
+    const withSS = childUrls.filter(u => D.screenshots[urlToSsKey(u.url)]);
+    if (withSS.length) {
+      html += `<h3>Screenshots (${withSS.length})</h3>`;
+      withSS.slice(0, 20).forEach(u => {
+        const ssKey = urlToSsKey(u.url);
+        html += `<div class="panel-url"><a href="${u.url}" target="_blank">${u.url}</a></div>`;
+        html += `<img class="panel-screenshot" src="screenshots/${ssKey}" onclick="openLB(this.src,'${u.url.replace(/'/g,"\\'")}')" loading="lazy">`;
+      });
+      if (withSS.length > 20) html += `<div style="color:#94a3b8;padding:4px">+${withSS.length-20} more...</div>`;
+    }
+  }
+
+  // Params
+  if (n._depth === 0 && D.paramNames.length) {
+    html += '<h3>Parameters</h3>';
+    D.paramNames.forEach(p => { html += `<span class="chip" style="background:#fef3c7;border-color:#fcd34d;margin:2px">${p}</span>`; });
+  }
+
+  // JS Files
+  if (n._depth === 0 && D.jsFiles.length) {
+    html += '<h3>JS Files</h3>';
+    D.jsFiles.forEach(f => { html += `<div class="panel-url"><a href="${f}" target="_blank">${f}</a></div>`; });
+  }
+
+  if (!html) html = '<div style="color:#94a3b8;padding:12px">Click nodes to explore. Drag to rearrange.</div>';
+  content.innerHTML = html;
+
+  document.querySelectorAll('.node.selected').forEach(el => el.classList.remove('selected'));
+  if (nodeEls[n._id]) nodeEls[n._id].classList.add('selected');
+  highlightPath(n);
+}
+
+// Pan & zoom
+function applyTransform() {
+  const g = document.getElementById('zoom-group');
+  if (g) g.setAttribute('transform', `translate(${transform.x},${transform.y}) scale(${transform.k})`);
+}
+
+function zoomBy(factor) {
+  transform.k *= factor;
+  transform.k = Math.max(0.15, Math.min(3, transform.k));
+  applyTransform();
+}
+
+function resetView() {
+  transform = { x: 40, y: H / 4, k: 0.9 };
+  applyTransform();
+}
+
+// Pan with mouse drag on canvas
+let panning = false, panStart;
+wrap.addEventListener('mousedown', (e) => {
+  if (e.target.closest('.node')) return;
+  panning = true; panStart = { x: e.clientX - transform.x, y: e.clientY - transform.y };
+  wrap.classList.add('grabbing');
+});
+document.addEventListener('mousemove', (e) => {
+  if (!panning) return;
+  transform.x = e.clientX - panStart.x;
+  transform.y = e.clientY - panStart.y;
+  applyTransform();
+});
+document.addEventListener('mouseup', () => { panning = false; wrap.classList.remove('grabbing'); });
+wrap.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoomBy(e.deltaY < 0 ? 1.1 : 0.9);
+}, { passive: false });
+
+function expandAll() {
+  function ex(n) { n._collapsed = false; if(n.children) n.children.forEach(ex); }
+  ex(D.tree); render(true);
+}
+function collapseAll() {
+  function cl(n,d) { if(d>0) n._collapsed = true; if(n.children) n.children.forEach(c=>cl(c,d+1)); }
+  cl(D.tree,0); render(true);
+}
+
+// Search
+let searchActive = false;
+document.getElementById('search').addEventListener('input', function() {
+  const q = this.value.toLowerCase();
+  function clearSearch(n) { n._collapsed = true; n._searchMatch = false; (n.children||[]).forEach(c => clearSearch(c)); }
+  clearSearch(D.tree);
+  if (!q) { D.tree._collapsed = false; searchActive = false; render(true); return; }
+  searchActive = true;
+  function markMatches(n) {
+    const selfMatch = n.name.toLowerCase().includes(q) || (n.urls||[]).some(u=>u.url.toLowerCase().includes(q));
+    if (selfMatch) n._searchMatch = true;
+    let childMatch = false;
+    if (n.children) n.children.forEach(c => { if(markMatches(c)) childMatch = true; });
+    if (childMatch) { n._collapsed = false; n._searchMatch = true; }
+    if (selfMatch && n._hasChildren) n._collapsed = false;
+    return selfMatch || childMatch;
+  }
+  markMatches(D.tree);
+  D.tree._collapsed = false;
+  render(true);
+});
+
+// Lightbox
+function openLB(src, url) {
+  document.getElementById('lb-img').src = src;
+  document.getElementById('lb-url').textContent = url||'';
+  document.getElementById('lightbox').classList.add('show');
+}
+document.getElementById('lightbox').addEventListener('click', function(e) {
+  if (e.target.id !== 'lb-img') this.classList.remove('show');
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') { document.getElementById('lightbox').classList.remove('show'); document.getElementById('panel').classList.remove('show'); }
+});
+
+// Init
+resetView();
+render(false);
+// Auto-select root
+selectNode(D.tree);
+</script>
+</body>
+</html>'''
+
+html = HTML.replace('__REPORT_DATA__', data, 1)
+with open(REPORT, 'w') as f:
+    f.write(html)
+
+size = os.path.getsize(REPORT)
+units = 'KB' if size < 1048576 else 'MB'
+val = size/1024 if size < 1048576 else size/1048576
+print(f"{val:.0f}{units}", file=sys.stderr)
+PYEOF
+
+    local SIZE
+    SIZE=$(python3 -c "import os; s=os.path.getsize('$REPORT'); print(f'{s/1024:.0f}K')" 2>/dev/null || echo "?")
+    log "Report saved to $REPORT ($SIZE)"
+}
+
+generate_report "$BASE" "$INPUT"
+log "Recon complete!"
