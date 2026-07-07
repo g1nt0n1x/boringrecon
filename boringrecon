@@ -416,6 +416,42 @@ if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
         fi
         info "Waiting for vhost scans..."
         wait
+
+        # Feroxbuster on vhosts
+        if check_tool feroxbuster && [ -f "$FEROX_WL" ]; then
+            info "Feroxbusting vhosts..."
+            VHOST_FEROX="$BASE/scans/feroxbuster_vhosts.txt"
+            > "$VHOST_FEROX"
+            while IFS= read -r vurl; do
+                info "Feroxbusting $vurl..."
+                feroxbuster -u "$vurl" -w "$FEROX_WL" \
+                    -d "$FEROX_DEPTH" -t 50 --no-state --silent \
+                    -s 200,201,301,302,303,307,308,401,403,405 \
+                    -x php,html,txt,json,xml,cfg,bak,old \
+                    "${FEROX_HEADERS[@]}" \
+                    2>/dev/null | grep -v '^$' >> "$VHOST_FEROX" &
+            done < "$VHOST_ALIVE"
+            wait
+            cat "$VHOST_FEROX" >> "$FEROX_OUT"
+            VHOST_FEROX_COUNT=$(wc -l < "$VHOST_FEROX" 2>/dev/null || echo 0)
+            if [ "$VHOST_FEROX_COUNT" -gt 0 ]; then
+                log "Feroxbuster found $VHOST_FEROX_COUNT vhost URLs"
+                VHOST_FEROX_NEW="$BASE/scans/ferox_vhost_new.txt"
+                sort -u "$VHOST_FEROX" > "$VHOST_FEROX.sorted"
+                sort -u "$BASE/crawl/vhost_urls.txt" 2>/dev/null > "$BASE/crawl/vhost_urls.txt.sorted"
+                comm -23 "$VHOST_FEROX.sorted" "$BASE/crawl/vhost_urls.txt.sorted" > "$VHOST_FEROX_NEW"
+                rm -f "$VHOST_FEROX.sorted" "$BASE/crawl/vhost_urls.txt.sorted"
+                VHOST_FEROX_NEW_COUNT=$(wc -l < "$VHOST_FEROX_NEW" 2>/dev/null || echo 0)
+                if [ "$VHOST_FEROX_NEW_COUNT" -gt 0 ] && check_tool katana; then
+                    log "Re-crawling $VHOST_FEROX_NEW_COUNT new vhost URLs with katana..."
+                    katana -list "$VHOST_FEROX_NEW" -silent \
+                        -depth 2 -js-crawl \
+                        -fs fqdn -crawl-out-scope '.*logout.*' \
+                        "${KATANA_HEADERS[@]}" \
+                        >> "$BASE/crawl/recrawl_urls.txt" 2>/dev/null
+                fi
+            fi
+        fi
     fi
 fi
 
