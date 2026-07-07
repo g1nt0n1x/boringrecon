@@ -23,15 +23,17 @@ usage() {
     echo -e "${BOLD}Usage:${RESET} boringrecon [options] <domain|URL>"
     echo
     echo -e "${BOLD}Options:${RESET}"
-    echo "  -q               Quick mode (top-100 nmap, skip subdomain enum)"
+    echo "  -q               Quick mode (top-100 nmap, skip nuclei/vhosts)"
+    echo "  -d               Deep mode (enable subfinder + amass subdomain enum)"
     echo "  -H <value|file>  Add custom HTTP header (repeatable)"
     echo "                     boringrecon -H 'Cookie: session=abc123' target"
     echo "                     boringrecon -H /path/to/headers.txt target"
     echo "  -h               Show this help"
     echo
     echo -e "${BOLD}Examples:${RESET}"
-    echo "  boringrecon example.com              Full scan on a domain"
+    echo "  boringrecon example.com              Standard scan on a domain"
     echo "  boringrecon -q http://10.10.11.5      Quick scan on an IP"
+    echo "  boringrecon -d example.com            Deep scan with subdomain enum"
     echo "  boringrecon -H cookies.txt -q target  Quick scan with auth cookies"
     echo
     echo -e "${BOLD}Output:${RESET}  Results saved to ./<target>/"
@@ -42,8 +44,8 @@ usage() {
     echo "  subdomains/        Alive hosts, httpx fingerprints"
     echo
     echo -e "${BOLD}Pipeline:${RESET}"
-    echo "  httpx → katana → nuclei → gowitness → ffuf (vhosts) → nmap"
-    echo "  Discovered vhosts are automatically re-scanned through the pipeline."
+    echo "  httpx → katana → feroxbuster → katana (re-crawl) → nuclei → ffuf → nmap → gowitness"
+    echo "  New dirs from feroxbuster are re-crawled. Discovered vhosts are re-scanned."
     exit 1
 }
 
@@ -62,11 +64,13 @@ check_tool() {
 
 # Parse args
 QUICK=false
+DEEP=false
 HEADERS=()
 
-while getopts "qhH:" opt; do
+while getopts "qdhH:" opt; do
     case $opt in
         q) QUICK=true ;;
+        d) DEEP=true ;;
         h) usage ;;
         H)
             if [ -f "$OPTARG" ]; then
@@ -104,17 +108,20 @@ KATANA_HEADERS=()
 NUCLEI_HEADERS=()
 GOWITNESS_HEADERS=()
 FFUF_HEADERS=()
+FEROX_HEADERS=()
 for h in "${HEADERS[@]}"; do
     HTTPX_HEADERS+=(-H "$h")
     KATANA_HEADERS+=(-H "$h")
     NUCLEI_HEADERS+=(-H "$h")
     GOWITNESS_HEADERS+=(--chrome-header "$h")
     FFUF_HEADERS+=(-H "$h")
+    FEROX_HEADERS+=(-H "$h")
 done
 
 banner
 info "Target: $INPUT"
-$QUICK && info "Quick mode enabled"
+$QUICK && info "Quick mode enabled (skipping nuclei, vhosts)"
+$DEEP && info "Deep mode enabled (subfinder + amass)"
 $URL_MODE && info "URL mode: skipping subdomain enumeration"
 [ ${#HEADERS[@]} -gt 0 ] && info "Custom headers: ${#HEADERS[@]} header(s) loaded"
 
@@ -155,23 +162,24 @@ elif $QUICK; then
         cp "$SUBS_CLEAN" "$ALIVE"
     fi
 else
-    log "Phase $PHASE: Subdomain Enumeration"
-
     SUBS_RAW="$BASE/subdomains/raw.txt"
     > "$SUBS_RAW"
 
-    if check_tool subfinder; then
-        info "Running subfinder..."
-        subfinder -d "$DOMAIN" -silent >> "$SUBS_RAW" &
+    if $DEEP; then
+        log "Phase $PHASE: Subdomain Enumeration (deep)"
+        if check_tool subfinder; then
+            info "Running subfinder..."
+            subfinder -d "$DOMAIN" -silent >> "$SUBS_RAW" &
+        fi
+        if check_tool assetfinder; then
+            info "Running assetfinder..."
+            assetfinder --subs-only "$DOMAIN" >> "$SUBS_RAW" &
+        fi
+        wait
+        log "Subdomain enumeration complete"
+    else
+        log "Phase $PHASE: Fingerprinting target"
     fi
-
-    if check_tool assetfinder; then
-        info "Running assetfinder..."
-        assetfinder --subs-only "$DOMAIN" >> "$SUBS_RAW" &
-    fi
-
-    wait
-    log "Subdomain enumeration complete"
 
     ((PHASE++))
     log "Phase $PHASE: Deduplication"
@@ -252,13 +260,13 @@ if check_tool katana; then
     info "Crawling with katana..."
     katana -list "$ALIVE" -silent \
         -depth 3 -js-crawl -known-files all \
-        -crawl-out-scope '.*logout.*' \
+        -fs fqdn -crawl-out-scope '.*logout.*' \
         "${KATANA_HEADERS[@]}" \
-        -output "$BASE/crawl/raw_endpoints.txt" 2>/dev/null &
+        -output "$BASE/crawl/katana_urls.txt" 2>/dev/null &
 fi
 
 # --- Nuclei ---
-if check_tool nuclei; then
+if ! $QUICK && check_tool nuclei; then
     info "Running nuclei..."
     nuclei -l "$ALIVE" -silent \
         -severity low,medium,high,critical \
@@ -267,7 +275,7 @@ if check_tool nuclei; then
 fi
 
 # --- Vhost Enumeration with ffuf ---
-if check_tool ffuf; then
+if ! $QUICK && check_tool ffuf; then
     if $URL_MODE; then
         VHOST_HOST=$(echo "$TARGET_URL" | sed 's|https\?://||;s|[:/].*||')
         VHOST_SCHEME=$(echo "$TARGET_URL" | grep -o '^https\?')
@@ -301,6 +309,55 @@ fi
 
 info "Waiting for scans to complete..."
 wait
+
+# --- Directory brute-force with feroxbuster ---
+if check_tool feroxbuster; then
+    ((PHASE++))
+    log "Phase $PHASE: Directory brute-force with feroxbuster"
+    FEROX_OUT="$BASE/scans/feroxbuster.txt"
+    if $QUICK; then
+        FEROX_WL="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+        FEROX_DEPTH=1
+    else
+        FEROX_WL="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+        FEROX_DEPTH=2
+    fi
+    if [ -f "$FEROX_WL" ]; then
+        > "$FEROX_OUT"
+        while IFS= read -r aurl; do
+            info "Feroxbusting $aurl..."
+            feroxbuster -u "$aurl" -w "$FEROX_WL" \
+                -d "$FEROX_DEPTH" -t 50 --no-state --silent \
+                -s 200,201,301,302,303,307,308,401,403,405 \
+                -x php,html,txt,json,xml,cfg,bak,old \
+                "${FEROX_HEADERS[@]}" \
+                2>/dev/null | grep -v '^$' >> "$FEROX_OUT" &
+        done < "$ALIVE"
+        info "Waiting for feroxbuster..."
+        wait
+        FEROX_COUNT=$(wc -l < "$FEROX_OUT" 2>/dev/null || echo 0)
+        if [ "$FEROX_COUNT" -gt 0 ]; then
+            log "Feroxbuster found $FEROX_COUNT URLs"
+            # Find new URLs not already discovered by katana
+            FEROX_NEW="$BASE/scans/ferox_new.txt"
+            sort -u "$FEROX_OUT" > "$FEROX_OUT.sorted"
+            sort -u "$BASE/crawl/katana_urls.txt" 2>/dev/null > "$BASE/crawl/katana_urls.txt.sorted"
+            comm -23 "$FEROX_OUT.sorted" "$BASE/crawl/katana_urls.txt.sorted" > "$FEROX_NEW"
+            rm -f "$FEROX_OUT.sorted" "$BASE/crawl/katana_urls.txt.sorted"
+            FEROX_NEW_COUNT=$(wc -l < "$FEROX_NEW" 2>/dev/null || echo 0)
+            if [ "$FEROX_NEW_COUNT" -gt 0 ] && check_tool katana; then
+                log "Re-crawling $FEROX_NEW_COUNT new URLs with katana..."
+                katana -list "$FEROX_NEW" -silent \
+                    -depth 2 -js-crawl \
+                    -fs fqdn -crawl-out-scope '.*logout.*' \
+                    "${KATANA_HEADERS[@]}" \
+                    -output "$BASE/crawl/recrawl_urls.txt" 2>/dev/null
+            fi
+        fi
+    else
+        warn "Feroxbuster wordlist not found: $FEROX_WL"
+    fi
+fi
 
 # --- Extract discovered vhosts ---
 if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
@@ -339,9 +396,9 @@ if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
             info "Crawling vhosts..."
             katana -list "$VHOST_ALIVE" -silent \
                 -depth 3 -js-crawl -known-files all \
-                -crawl-out-scope '.*logout.*' \
+                -fs fqdn -crawl-out-scope '.*logout.*' \
                 "${KATANA_HEADERS[@]}" \
-                >> "$BASE/crawl/raw_endpoints.txt" 2>/dev/null &
+                -output "$BASE/crawl/vhost_urls.txt" 2>/dev/null &
         fi
         if check_tool nuclei; then
             info "Scanning vhosts with nuclei..."
@@ -362,9 +419,13 @@ if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
     fi
 fi
 
-# Ensure all alive hosts appear in endpoints even if katana found nothing
-cat "$ALIVE" >> "$BASE/crawl/raw_endpoints.txt" 2>/dev/null
-touch "$BASE/crawl/raw_endpoints.txt"
+# Merge all source files into raw_endpoints.txt for post-processing
+> "$BASE/crawl/raw_endpoints.txt"
+for _src in katana_urls.txt recrawl_urls.txt vhost_urls.txt; do
+    [ -s "$BASE/crawl/$_src" ] && cat "$BASE/crawl/$_src" >> "$BASE/crawl/raw_endpoints.txt"
+done
+[ -s "$BASE/scans/feroxbuster.txt" ] && cat "$BASE/scans/feroxbuster.txt" >> "$BASE/crawl/raw_endpoints.txt"
+cat "$ALIVE" >> "$BASE/crawl/raw_endpoints.txt"
 
 # ============================================================
 # Post-processing: deduplicate crawl results
@@ -535,6 +596,18 @@ for line in read_lines(os.path.join(BASE, "scans/nuclei.txt")):
 # Build D3 tree: {name, children[], urls[], path}
 endpoints = read_lines(os.path.join(BASE, "crawl/endpoints.txt"))
 
+# Build URL → discovery source mapping
+url_sources = {}
+for src_file, label in [
+    ("crawl/katana_urls.txt", "katana"),
+    ("scans/feroxbuster.txt", "feroxbuster"),
+    ("crawl/recrawl_urls.txt", "re-crawl"),
+    ("crawl/vhost_urls.txt", "vhost"),
+]:
+    for u in read_lines(os.path.join(BASE, src_file)):
+        if u not in url_sources:
+            url_sources[u] = label
+
 def build_d3_tree(urls, target, alive_hosts):
     from collections import defaultdict
     root = {"name": target, "children": {}, "urls": [], "path": "/"}
@@ -593,7 +666,8 @@ data = json.dumps({
     "paramNames":read_lines(os.path.join(BASE,"crawl/param_names.txt")),
     "paramsUrls":read_lines(os.path.join(BASE,"crawl/params.txt")),
     "jsFiles":read_lines(os.path.join(BASE,"crawl/js_files.txt")),
-    "screenshots":screenshots
+    "screenshots":screenshots,
+    "urlSources":url_sources
 })
 
 HTML = r'''<!DOCTYPE html>
@@ -624,6 +698,7 @@ svg{display:block}
 .node circle{fill:#fff;stroke:#94a3b8;stroke-width:2px;transition:all 0.15s}
 .node:hover circle{stroke:#2563eb;stroke-width:2.5px}
 .node.has-children circle{fill:#eff6ff;stroke:#60a5fa}
+.node.has-param circle{fill:#fefce8;stroke:#facc15;stroke-width:2.5px}
 .node.has-vuln circle{fill:#fef2f2;stroke:#f87171;stroke-width:2.5px}
 .node.selected circle{fill:#dbeafe;stroke:#2563eb;stroke-width:3px}
 .node text{font:11px 'SF Mono','Fira Code',Consolas,monospace;fill:#334155;pointer-events:none}
@@ -655,6 +730,11 @@ svg{display:block}
 #search-box input{padding:6px 10px;border:1px solid #e0e0e0;border-radius:6px;font-family:inherit;font-size:0.9em;width:220px;background:#fff}
 #search-box input:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,0.15)}
 .vuln-item{padding:6px 8px;border:1px solid #fca5a5;border-radius:6px;margin-bottom:6px;background:#fff;font-size:0.85em}
+.src-badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:0.7em;font-weight:600;margin-left:4px;vertical-align:middle}
+.src-katana{background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd}
+.src-feroxbuster{background:#dcfce7;color:#166534;border:1px solid #86efac}
+.src-re-crawl{background:#e0e7ff;color:#4338ca;border:1px solid #a5b4fc}
+.src-vhost{background:#fae8ff;color:#a21caf;border:1px solid #e879f9}
 </style>
 </head>
 <body>
@@ -732,6 +812,7 @@ function initNode(d, parent, depth) {
   d._collapsed = depth > 1;
   d._x = 0; d._y = 0;
   d._hasChildren = d.children && d.children.length > 0;
+  d._hasParam = (d.urls||[]).some(u => Object.keys(u.params||{}).length > 0);
   d._hasVuln = D.vulns.some(v => v.url.includes('/' + d.path));
   nodeMap[d._id] = d;
   if (d.children) d.children.forEach(c => initNode(c, d, depth + 1));
@@ -813,6 +894,7 @@ function render(animate) {
     const ng = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     let cls = 'node';
     if (n._hasChildren) cls += ' has-children';
+    if (n._hasParam) cls += ' has-param';
     if (n._hasVuln) cls += ' has-vuln';
     if (selectedNode && selectedNode._id === n._id) cls += ' selected';
     ng.setAttribute('class', cls);
@@ -1017,7 +1099,9 @@ function selectNode(n) {
   if (urls.length) {
     html += `<h3>URLs (${urls.length})</h3>`;
     urls.forEach(u => {
+      const src = D.urlSources[u.url];
       html += `<div class="panel-url"><a href="${u.url}" target="_blank">${u.url}</a>`;
+      if (src) html += `<span class="src-badge src-${src}">${src}</span>`;
       const pkeys = Object.keys(u.params||{});
       if (pkeys.length) html += ' ' + pkeys.map(p => `<span class="chip" style="background:#fef3c7;border-color:#fcd34d">${p}</span>`).join('');
       html += '</div>';
