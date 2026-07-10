@@ -44,7 +44,7 @@ usage() {
     echo "  subdomains/        Alive hosts, httpx fingerprints"
     echo
     echo -e "${BOLD}Pipeline:${RESET}"
-    echo "  httpx → katana → feroxbuster → katana (re-crawl) → nuclei → ffuf → nmap → gowitness"
+    echo "  httpx → katana → feroxbuster → katana (re-crawl) → arjun → nuclei → ffuf → nmap → gowitness"
     echo "  New dirs from feroxbuster are re-crawled. Discovered vhosts are re-scanned."
     exit 1
 }
@@ -62,6 +62,43 @@ check_tool() {
     return 0
 }
 
+# --- Tool wrappers (dedupe the identical invocations used across phases) ---
+run_httpx() {      # $1 = list file; fingerprint output to stdout
+    httpx -l "$1" -silent -status-code -title -tech-detect -content-length \
+        -follow-redirects "${HTTPX_HEADERS[@]}" 2>/dev/null
+}
+run_katana() {     # $1 = list  $2 = depth  $3 = "all" enables -known-files; URLs to stdout
+    local kf=(); [ "$3" = all ] && kf=(-known-files all)
+    katana -list "$1" -silent -depth "$2" -js-crawl "${kf[@]}" \
+        -fs fqdn -crawl-out-scope '.*logout.*' "${KATANA_HEADERS[@]}" 2>/dev/null
+}
+run_nuclei() {     # $1 = list file; findings to stdout
+    nuclei -l "$1" -silent -severity low,medium,high,critical \
+        "${NUCLEI_HEADERS[@]}" 2>/dev/null
+}
+run_gowitness() {  # $1 = list file of URLs
+    gowitness scan file -f "$1" --screenshot-path "$BASE/screenshots" \
+        --write-db=false "${GOWITNESS_HEADERS[@]}" 2>/dev/null
+}
+run_ferox() {      # $1 = list of URLs, $2 = output file; one feroxbuster per URL, in parallel
+    : > "$2"
+    while IFS= read -r u; do
+        [ -z "$u" ] && continue
+        info "Feroxbusting $u..."
+        feroxbuster -u "$u" -w "$FEROX_WL" -d "$FEROX_DEPTH" -t 50 --no-state --silent \
+            -s 200,201,301,302,303,307,308,401,403,405 \
+            -x php,html,txt,json,xml,cfg,bak,old \
+            "${FEROX_HEADERS[@]}" 2>/dev/null | grep --line-buffered -v '^$' >> "$2" &
+    done < "$1"
+    wait
+}
+recrawl_diff() {   # $1 = ferox out, $2 = crawl file to diff against; prints URLs new to $1
+    sort -u "$1" > "$1.sorted"
+    sort -u "$2" 2>/dev/null > "$2.sorted"
+    comm -23 "$1.sorted" "$2.sorted"
+    rm -f "$1.sorted" "$2.sorted"
+}
+
 # Parse args
 QUICK=false
 DEEP=false
@@ -75,7 +112,13 @@ while getopts "qdhH:" opt; do
         H)
             if [ -f "$OPTARG" ]; then
                 while IFS= read -r line; do
-                    [ -n "$line" ] && [[ ! "$line" =~ ^# ]] && HEADERS+=("$line")
+                    [ -z "$line" ] || [[ "$line" =~ ^# ]] && continue
+                    # Lines without "Name: value" format are raw cookie values
+                    if [[ "$line" != *": "* ]]; then
+                        HEADERS+=("Cookie: $line")
+                    else
+                        HEADERS+=("$line")
+                    fi
                 done < "$OPTARG"
             else
                 HEADERS+=("$OPTARG")
@@ -97,6 +140,8 @@ if [[ "$INPUT" =~ ^https?:// ]]; then
     DIRNAME=$(echo "$INPUT" | sed 's|https\?://||;s|[/:.]|_|g;s|_$||')
     # Extract hostname/IP for nmap (strip scheme, path, port)
     NMAP_TARGET=$(echo "$INPUT" | sed 's|https\?://||;s|[:/].*||')
+    # Preserve an explicit port so nmap actually scans the target's service
+    NMAP_PORT=$(echo "$INPUT" | sed -n 's|https\?://[^:/]*:\([0-9]\+\).*|\1|p')
 else
     DOMAIN="$INPUT"
     DIRNAME="$DOMAIN"
@@ -109,6 +154,8 @@ NUCLEI_HEADERS=()
 GOWITNESS_HEADERS=()
 FFUF_HEADERS=()
 FEROX_HEADERS=()
+ARJUN_HEADERS=()          # arjun wants newline-delimited "Key: Value", NOT JSON
+REDIR_HEADERS_FILE=""
 for h in "${HEADERS[@]}"; do
     HTTPX_HEADERS+=(-H "$h")
     KATANA_HEADERS+=(-H "$h")
@@ -117,6 +164,13 @@ for h in "${HEADERS[@]}"; do
     FFUF_HEADERS+=(-H "$h")
     FEROX_HEADERS+=(-H "$h")
 done
+if [ ${#HEADERS[@]} -gt 0 ]; then
+    ARJUN_HEADERS=(--headers "$(printf '%s\n' "${HEADERS[@]}")")
+    REDIR_HEADERS_FILE=$(mktemp)
+    printf '%s\n' "${HEADERS[@]}" > "$REDIR_HEADERS_FILE"
+fi
+# Clean up the temp headers file no matter how we exit
+trap '[ -n "$REDIR_HEADERS_FILE" ] && rm -f "$REDIR_HEADERS_FILE"' EXIT
 
 banner
 info "Target: $INPUT"
@@ -140,23 +194,14 @@ if $URL_MODE; then
 
     log "Phase $PHASE: Fingerprinting target"
     if check_tool httpx; then
-        httpx -l "$ALIVE" -silent \
-            -status-code -title -tech-detect -content-length \
-            -follow-redirects \
-            "${HTTPX_HEADERS[@]}" \
-            -o "$HTTPX_FULL" 2>/dev/null
+        run_httpx "$ALIVE" > "$HTTPX_FULL"
     fi
 elif $QUICK; then
     echo "$DOMAIN" > "$SUBS_CLEAN"
 
     log "Phase $PHASE: Fingerprinting target (quick — skipping subdomain enum)"
     if check_tool httpx; then
-        httpx -l "$SUBS_CLEAN" -silent \
-            -status-code -title -tech-detect -content-length \
-            -follow-redirects \
-            "${HTTPX_HEADERS[@]}" \
-            -o "$HTTPX_FULL" 2>/dev/null
-
+        run_httpx "$SUBS_CLEAN" > "$HTTPX_FULL"
         awk '{print $1}' "$HTTPX_FULL" > "$ALIVE"
     else
         cp "$SUBS_CLEAN" "$ALIVE"
@@ -184,7 +229,10 @@ else
     ((PHASE++))
     log "Phase $PHASE: Deduplication"
 
-    sort -u "$SUBS_RAW" | grep -F ".$DOMAIN" | grep -v '^\*' > "$SUBS_CLEAN"
+    # Suffix-anchored: keep only the domain itself and true subdomains
+    # (rejects lookalikes such as example.com.evil.com or notexample.com).
+    DOMAIN_RE=$(printf '%s' "$DOMAIN" | sed 's/\./\\./g')
+    sort -u "$SUBS_RAW" | grep -iE "(^|\.)${DOMAIN_RE}\$" | grep -v '^\*' > "$SUBS_CLEAN"
     echo "$DOMAIN" >> "$SUBS_CLEAN"
     sort -u -o "$SUBS_CLEAN" "$SUBS_CLEAN"
 
@@ -200,12 +248,7 @@ else
     log "Phase $PHASE: Alive check & fingerprinting with httpx"
 
     if check_tool httpx; then
-        httpx -l "$SUBS_CLEAN" -silent \
-            -status-code -title -tech-detect -content-length \
-            -follow-redirects \
-            "${HTTPX_HEADERS[@]}" \
-            -o "$HTTPX_FULL" 2>/dev/null
-
+        run_httpx "$SUBS_CLEAN" > "$HTTPX_FULL"
         awk '{print $1}' "$HTTPX_FULL" > "$ALIVE"
 
         ALIVE_COUNT=$(wc -l < "$ALIVE")
@@ -237,20 +280,21 @@ fi
 # --- Screenshots (root/alive only — subfolder screenshots happen after crawl) ---
 if check_tool gowitness; then
     info "Taking screenshots..."
-    gowitness scan file -f "$ALIVE" \
-        --screenshot-path "$BASE/screenshots" \
-        --write-db=false \
-        "${GOWITNESS_HEADERS[@]}" 2>/dev/null &
+    run_gowitness "$ALIVE" &
 fi
 
 # --- Port Scan (use hostname, not URL) ---
 if check_tool nmap; then
     info "Port scanning..."
+    # nmap forbids --top-ports with -p, so if the target URL named an explicit
+    # port, scan an inclusive range (common ports + that port) instead.
     if $QUICK; then
-        nmap -T4 --top-ports 100 -oN "$BASE/scans/nmap_quick.txt" \
+        [ -n "${NMAP_PORT:-}" ] && NMAP_PORTS=(-p "${NMAP_PORT},1-100") || NMAP_PORTS=(--top-ports 100)
+        nmap -T4 "${NMAP_PORTS[@]}" -oN "$BASE/scans/nmap_quick.txt" \
             -iL "$SUBS_CLEAN" > /dev/null 2>&1 &
     else
-        nmap -T4 -sC -sV --top-ports 1000 -oN "$BASE/scans/nmap_full.txt" \
+        [ -n "${NMAP_PORT:-}" ] && NMAP_PORTS=(-p "${NMAP_PORT},1-1000") || NMAP_PORTS=(--top-ports 1000)
+        nmap -T4 -sC -sV "${NMAP_PORTS[@]}" -oN "$BASE/scans/nmap_full.txt" \
             -iL "$SUBS_CLEAN" > /dev/null 2>&1 &
     fi
 fi
@@ -258,20 +302,13 @@ fi
 # --- Crawl with Katana ---
 if check_tool katana; then
     info "Crawling with katana..."
-    katana -list "$ALIVE" -silent \
-        -depth 3 -js-crawl -known-files all \
-        -fs fqdn -crawl-out-scope '.*logout.*' \
-        "${KATANA_HEADERS[@]}" \
-        -output "$BASE/crawl/katana_urls.txt" 2>/dev/null &
+    run_katana "$ALIVE" 3 all > "$BASE/crawl/katana_urls.txt" &
 fi
 
 # --- Nuclei ---
 if ! $QUICK && check_tool nuclei; then
     info "Running nuclei..."
-    nuclei -l "$ALIVE" -silent \
-        -severity low,medium,high,critical \
-        "${NUCLEI_HEADERS[@]}" \
-        -o "$BASE/scans/nuclei.txt" 2>/dev/null &
+    run_nuclei "$ALIVE" > "$BASE/scans/nuclei.txt" &
 fi
 
 # --- Vhost Enumeration with ffuf ---
@@ -323,35 +360,17 @@ if check_tool feroxbuster; then
         FEROX_DEPTH=2
     fi
     if [ -f "$FEROX_WL" ]; then
-        > "$FEROX_OUT"
-        while IFS= read -r aurl; do
-            info "Feroxbusting $aurl..."
-            feroxbuster -u "$aurl" -w "$FEROX_WL" \
-                -d "$FEROX_DEPTH" -t 50 --no-state --silent \
-                -s 200,201,301,302,303,307,308,401,403,405 \
-                -x php,html,txt,json,xml,cfg,bak,old \
-                "${FEROX_HEADERS[@]}" \
-                2>/dev/null | grep -v '^$' >> "$FEROX_OUT" &
-        done < "$ALIVE"
-        info "Waiting for feroxbuster..."
-        wait
+        run_ferox "$ALIVE" "$FEROX_OUT"
         FEROX_COUNT=$(wc -l < "$FEROX_OUT" 2>/dev/null || echo 0)
         if [ "$FEROX_COUNT" -gt 0 ]; then
             log "Feroxbuster found $FEROX_COUNT URLs"
-            # Find new URLs not already discovered by katana
+            # Find new URLs not already discovered by katana, then re-crawl them
             FEROX_NEW="$BASE/scans/ferox_new.txt"
-            sort -u "$FEROX_OUT" > "$FEROX_OUT.sorted"
-            sort -u "$BASE/crawl/katana_urls.txt" 2>/dev/null > "$BASE/crawl/katana_urls.txt.sorted"
-            comm -23 "$FEROX_OUT.sorted" "$BASE/crawl/katana_urls.txt.sorted" > "$FEROX_NEW"
-            rm -f "$FEROX_OUT.sorted" "$BASE/crawl/katana_urls.txt.sorted"
+            recrawl_diff "$FEROX_OUT" "$BASE/crawl/katana_urls.txt" > "$FEROX_NEW"
             FEROX_NEW_COUNT=$(wc -l < "$FEROX_NEW" 2>/dev/null || echo 0)
             if [ "$FEROX_NEW_COUNT" -gt 0 ] && check_tool katana; then
                 log "Re-crawling $FEROX_NEW_COUNT new URLs with katana..."
-                katana -list "$FEROX_NEW" -silent \
-                    -depth 2 -js-crawl \
-                    -fs fqdn -crawl-out-scope '.*logout.*' \
-                    "${KATANA_HEADERS[@]}" \
-                    -output "$BASE/crawl/recrawl_urls.txt" 2>/dev/null
+                run_katana "$FEROX_NEW" 2 "" > "$BASE/crawl/recrawl_urls.txt"
             fi
         fi
     else
@@ -360,7 +379,10 @@ if check_tool feroxbuster; then
 fi
 
 # --- Extract discovered vhosts ---
-if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
+# Guard on VHOST_HOST: it is only set when the ffuf vhost phase actually ran
+# this invocation, so a stale vhosts.json from a prior run can't be reused
+# with empty VHOST_* vars (which would emit malformed "foo." hosts).
+if ! $QUICK && [ -n "${VHOST_HOST:-}" ] && [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
     jq -r '.results[]?.input.FUZZ // empty' "$BASE/scans/vhosts.json" 2>/dev/null \
         | sort -u | while read -r vhost; do
             echo "${vhost}.${VHOST_HOST}"
@@ -387,32 +409,19 @@ if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
         done < "$BASE/subdomains/vhosts.txt" > "$VHOST_ALIVE"
 
         if check_tool httpx; then
-            httpx -l "$VHOST_ALIVE" -silent \
-                -status-code -title -tech-detect -content-length \
-                -follow-redirects \
-                "${HTTPX_HEADERS[@]}" 2>/dev/null >> "$HTTPX_FULL" &
+            run_httpx "$VHOST_ALIVE" >> "$HTTPX_FULL" &
         fi
         if check_tool katana; then
             info "Crawling vhosts..."
-            katana -list "$VHOST_ALIVE" -silent \
-                -depth 3 -js-crawl -known-files all \
-                -fs fqdn -crawl-out-scope '.*logout.*' \
-                "${KATANA_HEADERS[@]}" \
-                -output "$BASE/crawl/vhost_urls.txt" 2>/dev/null &
+            run_katana "$VHOST_ALIVE" 3 all > "$BASE/crawl/vhost_urls.txt" &
         fi
         if check_tool nuclei; then
             info "Scanning vhosts with nuclei..."
-            nuclei -l "$VHOST_ALIVE" -silent \
-                -severity low,medium,high,critical \
-                "${NUCLEI_HEADERS[@]}" \
-                >> "$BASE/scans/nuclei.txt" 2>/dev/null &
+            run_nuclei "$VHOST_ALIVE" >> "$BASE/scans/nuclei.txt" &
         fi
         if check_tool gowitness; then
             info "Screenshotting vhosts..."
-            gowitness scan file -f "$VHOST_ALIVE" \
-                --screenshot-path "$BASE/screenshots" \
-                --write-db=false \
-                "${GOWITNESS_HEADERS[@]}" 2>/dev/null &
+            run_gowitness "$VHOST_ALIVE" &
         fi
         info "Waiting for vhost scans..."
         wait
@@ -421,34 +430,17 @@ if [ -f "$BASE/scans/vhosts.json" ] && check_tool jq; then
         if check_tool feroxbuster && [ -f "$FEROX_WL" ]; then
             info "Feroxbusting vhosts..."
             VHOST_FEROX="$BASE/scans/feroxbuster_vhosts.txt"
-            > "$VHOST_FEROX"
-            while IFS= read -r vurl; do
-                info "Feroxbusting $vurl..."
-                feroxbuster -u "$vurl" -w "$FEROX_WL" \
-                    -d "$FEROX_DEPTH" -t 50 --no-state --silent \
-                    -s 200,201,301,302,303,307,308,401,403,405 \
-                    -x php,html,txt,json,xml,cfg,bak,old \
-                    "${FEROX_HEADERS[@]}" \
-                    2>/dev/null | grep -v '^$' >> "$VHOST_FEROX" &
-            done < "$VHOST_ALIVE"
-            wait
+            run_ferox "$VHOST_ALIVE" "$VHOST_FEROX"
             cat "$VHOST_FEROX" >> "$FEROX_OUT"
             VHOST_FEROX_COUNT=$(wc -l < "$VHOST_FEROX" 2>/dev/null || echo 0)
             if [ "$VHOST_FEROX_COUNT" -gt 0 ]; then
                 log "Feroxbuster found $VHOST_FEROX_COUNT vhost URLs"
                 VHOST_FEROX_NEW="$BASE/scans/ferox_vhost_new.txt"
-                sort -u "$VHOST_FEROX" > "$VHOST_FEROX.sorted"
-                sort -u "$BASE/crawl/vhost_urls.txt" 2>/dev/null > "$BASE/crawl/vhost_urls.txt.sorted"
-                comm -23 "$VHOST_FEROX.sorted" "$BASE/crawl/vhost_urls.txt.sorted" > "$VHOST_FEROX_NEW"
-                rm -f "$VHOST_FEROX.sorted" "$BASE/crawl/vhost_urls.txt.sorted"
+                recrawl_diff "$VHOST_FEROX" "$BASE/crawl/vhost_urls.txt" > "$VHOST_FEROX_NEW"
                 VHOST_FEROX_NEW_COUNT=$(wc -l < "$VHOST_FEROX_NEW" 2>/dev/null || echo 0)
                 if [ "$VHOST_FEROX_NEW_COUNT" -gt 0 ] && check_tool katana; then
                     log "Re-crawling $VHOST_FEROX_NEW_COUNT new vhost URLs with katana..."
-                    katana -list "$VHOST_FEROX_NEW" -silent \
-                        -depth 2 -js-crawl \
-                        -fs fqdn -crawl-out-scope '.*logout.*' \
-                        "${KATANA_HEADERS[@]}" \
-                        >> "$BASE/crawl/recrawl_urls.txt" 2>/dev/null
+                    run_katana "$VHOST_FEROX_NEW" 2 "" >> "$BASE/crawl/recrawl_urls.txt"
                 fi
             fi
         fi
@@ -470,23 +462,25 @@ if [ -s "$BASE/crawl/raw_endpoints.txt" ]; then
     ((PHASE++))
     log "Phase $PHASE: Processing crawl results"
 
-    # Determine target scope for filtering (strip scheme + trailing slash)
-    SCOPE_PATTERNS=()
+    # Build a HOST-anchored scope regex so only URLs whose host is in scope
+    # survive. A plain substring match would admit example.com.evil.com etc.
+    esc_re() { printf '%s' "$1" | sed 's/\./\\./g'; }
     if $URL_MODE; then
-        SCOPE_PATTERNS+=("$(echo "$TARGET_URL" | sed 's|/$||')")
-        # Include discovered vhosts in scope
+        # Exact target host, plus any discovered vhost host
+        SCOPE_HOSTS=("$NMAP_TARGET")
         if [ -s "$BASE/subdomains/vhosts.txt" ]; then
-            while read -r vh; do
-                SCOPE_PATTERNS+=("${vh}")
-            done < "$BASE/subdomains/vhosts.txt"
+            while read -r vh; do [ -n "$vh" ] && SCOPE_HOSTS+=("$vh"); done \
+                < "$BASE/subdomains/vhosts.txt"
         fi
+        ALT=""; for h in "${SCOPE_HOSTS[@]}"; do ALT="${ALT:+$ALT|}$(esc_re "$h")"; done
+        # Anchor at the scheme so the host is the real host, not a value
+        # embedded in a query string (e.g. ?next=http://in-scope).
+        SCOPE_RE="^https?://(${ALT})([:/]|\$)"
     else
-        SCOPE_PATTERNS+=("$DOMAIN")
+        # The domain itself or any subdomain of it
+        SCOPE_RE="^https?://([^/@:]*\.)?$(esc_re "$DOMAIN")([:/]|\$)"
     fi
-
-    # Deduplicate endpoints, keep only in-scope (match any scope pattern)
-    SCOPE_GREP=$(printf '%s\n' "${SCOPE_PATTERNS[@]}")
-    grep -F -f <(echo "$SCOPE_GREP") "$BASE/crawl/raw_endpoints.txt" | sort -u > "$BASE/crawl/endpoints.txt"
+    grep -iE "$SCOPE_RE" "$BASE/crawl/raw_endpoints.txt" | sort -u > "$BASE/crawl/endpoints.txt"
     ENDPOINTS=$(wc -l < "$BASE/crawl/endpoints.txt")
     info "$ENDPOINTS unique in-scope endpoints"
 
@@ -517,13 +511,207 @@ if [ -s "$BASE/crawl/raw_endpoints.txt" ]; then
         SCREENSHOT_COUNT=$(wc -l < "$BASE/crawl/screenshot_urls.txt")
         info "Screenshotting $SCREENSHOT_COUNT unique pages..."
 
-        gowitness scan file -f "$BASE/crawl/screenshot_urls.txt" \
-            --screenshot-path "$BASE/screenshots" \
-            --write-db=false \
-            "${GOWITNESS_HEADERS[@]}" 2>/dev/null
+        run_gowitness "$BASE/crawl/screenshot_urls.txt"
 
         TAKEN=$(ls -1 "$BASE/screenshots/" 2>/dev/null | wc -l)
         log "$TAKEN screenshots saved"
+    fi
+
+    # --- Parameter discovery with Arjun ---
+    if check_tool arjun; then
+        ((PHASE++))
+        log "Phase $PHASE: Parameter discovery with arjun (parallel)"
+
+        ARJUN_INPUT="$BASE/crawl/arjun_targets.txt"
+        ARJUN_OUT="$BASE/crawl/arjun_params.json"
+        ARJUN_BATCH_DIR="$BASE/crawl/.arjun_batches"
+        mkdir -p "$ARJUN_BATCH_DIR"
+
+        # Build target list: unique base URLs, skip static assets
+        # Sort by path depth (shorter paths first — more likely to have params)
+        sed 's|?.*||' "$BASE/crawl/endpoints.txt" \
+            | grep -viE '\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map|pdf|zip|tar|gz)$' \
+            | sort -u \
+            | awk -F/ '{print NF, $0}' | sort -n | cut -d' ' -f2- \
+            | head -100 \
+            > "$ARJUN_INPUT"
+
+        ARJUN_COUNT=$(wc -l < "$ARJUN_INPUT")
+        ARJUN_WORKERS=8
+
+        if [ "$ARJUN_COUNT" -gt 0 ]; then
+            info "Running arjun on $ARJUN_COUNT endpoints ($ARJUN_WORKERS parallel workers)..."
+            # Split targets into batches and run arjun in parallel
+            split -n "l/$ARJUN_WORKERS" --numeric-suffixes=1 "$ARJUN_INPUT" "$ARJUN_BATCH_DIR/batch_"
+            for batch in "$ARJUN_BATCH_DIR"/batch_*; do
+                [ -s "$batch" ] || continue
+                timeout 120 arjun -i "$batch" -oJ "${batch}.json" -t 10 -T 10 \
+                    "${ARJUN_HEADERS[@]}" >/dev/null 2>&1 &
+            done
+            wait
+        else
+            warn "No arjun targets after filtering — skipping"
+        fi
+
+        # Merge all batch JSON outputs into one
+        python3 -c '
+import json, sys, glob
+merged = {}
+for f in sorted(glob.glob(sys.argv[1] + "/batch_*.json")):
+    try:
+        data = json.load(open(f))
+        if isinstance(data, dict):
+            merged.update(data)
+        elif isinstance(data, list):
+            for item in data:
+                url = item.get("url", "")
+                if url: merged[url] = item
+    except: pass
+json.dump(merged, open(sys.argv[2], "w"), indent=4)
+' "$ARJUN_BATCH_DIR" "$ARJUN_OUT" 2>/dev/null
+
+        rm -rf "$ARJUN_BATCH_DIR"
+
+        if [ -s "$ARJUN_OUT" ]; then
+            ARJUN_FOUND=$(python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+total = 0
+entries = data if isinstance(data, list) else [{"url": u, "params": (v if isinstance(v, list) else v.get("params", []))} for u, v in data.items()]
+with open(sys.argv[2], "a") as pf, open(sys.argv[3], "a") as nf:
+    for item in entries:
+        url = item.get("url", "")
+        params = item.get("params", [])
+        if params:
+            total += len(params)
+            pf.write(url + "?" + "&".join(p + "=" for p in params) + "\n")
+            for p in params:
+                nf.write(p + "\n")
+print(total)
+' "$ARJUN_OUT" "$BASE/crawl/params.txt" "$BASE/crawl/param_names.txt" 2>/dev/null || echo 0)
+            log "Arjun discovered $ARJUN_FOUND parameter(s)"
+        else
+            warn "Arjun found no parameters"
+            echo '{}' > "$ARJUN_OUT"
+        fi
+
+        # Supplementary: detect redirect parameters on 3xx endpoints (parallel)
+        # Arjun misses params that only change the Location header
+        info "Checking for redirect parameters..."
+        python3 -c '
+import json, sys, urllib.request, urllib.error, threading
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+targets_file, arjun_file, params_file, names_file, headers_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else ""
+redirect_params = ["url", "redirect", "next", "return", "returnTo", "return_to",
+    "dest", "destination", "target", "goto", "to", "out", "redir",
+    "redirect_url", "redirect_uri", "continue", "forward", "ref",
+    "callback", "path", "link", "site"]
+
+custom_headers = {}
+if headers_file:
+    try:
+        for line in open(headers_file):
+            line = line.strip()
+            if ": " in line:
+                k, _, v = line.partition(": ")
+                custom_headers[k] = v
+    except: pass
+
+with open(targets_file) as f:
+    targets = [l.strip() for l in f if l.strip()]
+
+try:
+    arjun = json.load(open(arjun_file))
+except:
+    arjun = {}
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+lock = threading.Lock()
+
+def check_target(target):
+    if target in arjun and arjun[target].get("params"):
+        return None
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        req = urllib.request.Request(target)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        for k, v in custom_headers.items(): req.add_header(k, v)
+        try:
+            opener.open(req, timeout=5)
+            return None
+        except urllib.error.HTTPError as e:
+            if e.code not in (301, 302, 303, 307, 308):
+                return None
+            base_location = e.headers.get("Location", "")
+        except:
+            return None
+
+        hit_params = []
+        for p in redirect_params:
+            test_url = target + ("&" if "?" in target else "?") + p + "=https://evil.example.com/redir-test"
+            try:
+                req2 = urllib.request.Request(test_url)
+                req2.add_header("User-Agent", "Mozilla/5.0")
+                for k, v in custom_headers.items(): req2.add_header(k, v)
+                try:
+                    opener.open(req2, timeout=5)
+                    continue
+                except urllib.error.HTTPError as e2:
+                    if e2.code not in (301, 302, 303, 307, 308):
+                        continue
+                    new_location = e2.headers.get("Location", "")
+                    if new_location == base_location:
+                        continue
+                    parsed = urlparse(new_location)
+                    if parsed.netloc == "evil.example.com":
+                        hit_params.append(p)
+            except:
+                continue
+        return (target, hit_params) if hit_params else None
+    except:
+        return None
+
+found = 0
+with ThreadPoolExecutor(max_workers=10) as pool:
+    futures = {pool.submit(check_target, t): t for t in targets}
+    for future in as_completed(futures):
+        result = future.result()
+        if not result:
+            continue
+        target, hit_params = result
+        found += len(hit_params)
+        with lock:
+            if target not in arjun:
+                arjun[target] = {"method": "GET", "params": hit_params, "headers": {}}
+            else:
+                existing = arjun[target].get("params", [])
+                arjun[target]["params"] = list(set(existing + hit_params))
+
+if found:
+    with open(arjun_file, "w") as f:
+        json.dump(arjun, f, indent=4)
+    with open(params_file, "a") as pf, open(names_file, "a") as nf:
+        for url, info in arjun.items():
+            params = info.get("params", [])
+            if params:
+                pf.write(url + "?" + "&".join(p + "=" for p in params) + "\n")
+                for p in params:
+                    nf.write(p + "\n")
+    print(found)
+else:
+    print(0)
+' "$ARJUN_INPUT" "$ARJUN_OUT" "$BASE/crawl/params.txt" "$BASE/crawl/param_names.txt" "$REDIR_HEADERS_FILE" 2>/dev/null
+        REDIR_COUNT=$(python3 -c "
+import json
+d=json.load(open('$ARJUN_OUT'))
+print(sum(len(v.get('params',[])) for v in d.values()))
+" 2>/dev/null || echo 0)
+        log "Total discovered parameters: $REDIR_COUNT"
     fi
 fi
 
@@ -561,6 +749,18 @@ fi
 
 SCREENSHOT_TOTAL=$(ls -1 "$BASE/screenshots/" 2>/dev/null | wc -l)
 [ "$SCREENSHOT_TOTAL" -gt 0 ] && echo -e "  Screenshots:    $SCREENSHOT_TOTAL"
+
+if [ -s "$BASE/crawl/arjun_params.json" ]; then
+    ARJUN_SUMMARY=$(python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+entries = data if isinstance(data, list) else [{"url": u, "params": (v if isinstance(v, list) else v.get("params", []))} for u, v in data.items()]
+urls = sum(1 for i in entries if i.get("params"))
+params = sum(len(i.get("params", [])) for i in entries)
+print(f"{params} params on {urls} endpoints")
+' "$BASE/crawl/arjun_params.json" 2>/dev/null || echo "?")
+    echo -e "  ${YELLOW}Arjun:          $ARJUN_SUMMARY${RESET}"
+fi
 
 if [ -s "$BASE/scans/nuclei.txt" ]; then
     VULN_COUNT=$(wc -l < "$BASE/scans/nuclei.txt")
@@ -639,6 +839,20 @@ for line in read_lines(os.path.join(BASE, "subdomains/takeover.txt")):
                 takeovers[p.lower()] = line.strip()
                 break
 
+# Parse arjun results
+arjun_params = {}
+arjun_file = os.path.join(BASE, "crawl/arjun_params.json")
+if os.path.exists(arjun_file):
+    try:
+        raw = json.load(open(arjun_file))
+        entries = raw if isinstance(raw, list) else [{"url": u, "params": (v if isinstance(v, list) else v.get("params", []))} for u, v in raw.items()]
+        for item in entries:
+            url = item.get("url", "")
+            params = item.get("params", [])
+            if params:
+                arjun_params[url.rstrip("/")] = params
+    except: pass
+
 # Build D3 tree: {name, children[], urls[], path}
 endpoints = read_lines(os.path.join(BASE, "crawl/endpoints.txt"))
 
@@ -714,7 +928,8 @@ data = json.dumps({
     "jsFiles":read_lines(os.path.join(BASE,"crawl/js_files.txt")),
     "screenshots":screenshots,
     "urlSources":url_sources,
-    "takeovers":takeovers
+    "takeovers":takeovers,
+    "arjunParams":arjun_params
 })
 
 HTML = r'''<!DOCTYPE html>
@@ -783,6 +998,11 @@ svg{display:block}
 .src-feroxbuster{background:#dcfce7;color:#166534;border:1px solid #86efac}
 .src-re-crawl{background:#e0e7ff;color:#4338ca;border:1px solid #a5b4fc}
 .src-vhost{background:#fae8ff;color:#a21caf;border:1px solid #e879f9}
+.src-arjun{background:#fef3c7;color:#92400e;border:1px solid #fcd34d}
+.filter-btn{padding:5px 10px;border:1px solid #e0e0e0;border-radius:6px;font-family:inherit;font-size:0.85em;background:#fff;cursor:pointer;margin-left:4px}
+.filter-btn:hover{background:#f1f5f9;border-color:#94a3b8}
+.filter-btn.active-params{background:#fef3c7;border-color:#fcd34d;font-weight:600}
+.filter-btn.active-vulns{background:#fef2f2;border-color:#fca5a5;font-weight:600}
 </style>
 </head>
 <body>
@@ -793,7 +1013,7 @@ svg{display:block}
 </div>
 <div id="main">
   <div id="canvas-wrap">
-    <div id="search-box"><input type="text" id="search" placeholder="Search endpoints..."></div>
+    <div id="search-box"><input type="text" id="search" placeholder="Search endpoints..."><button class="filter-btn" id="btn-params" onclick="toggleFilter('params')">Params</button><button class="filter-btn" id="btn-vulns" onclick="toggleFilter('vulns')">Vulns</button></div>
     <div id="canvas"></div>
     <div id="controls">
       <button onclick="zoomBy(1.3)" title="Zoom in">+</button>
@@ -853,6 +1073,12 @@ const W = wrap.clientWidth, H = wrap.clientHeight;
 let allNodes = [], allLinks = [], nodeMap = {};
 let nextId = 0;
 
+// Build lookup set of paths where arjun discovered params
+const arjunPaths = new Set();
+Object.keys(D.arjunParams||{}).forEach(url => {
+  try { arjunPaths.add(new URL(url).pathname.replace(/^\/|\/$/g, '')); } catch(e) {}
+});
+
 function initNode(d, parent, depth) {
   d._id = nextId++;
   d._depth = depth;
@@ -860,7 +1086,7 @@ function initNode(d, parent, depth) {
   d._collapsed = depth > 1;
   d._x = 0; d._y = 0;
   d._hasChildren = d.children && d.children.length > 0;
-  d._hasParam = (d.urls||[]).some(u => Object.keys(u.params||{}).length > 0);
+  d._hasParam = (d.urls||[]).some(u => Object.keys(u.params||{}).length > 0) || arjunPaths.has(d.path) || arjunPaths.has(d.name);
   d._hasVuln = D.vulns.some(v => v.url.includes('/' + d.path));
   nodeMap[d._id] = d;
   if (d.children) d.children.forEach(c => initNode(c, d, depth + 1));
@@ -1164,6 +1390,30 @@ function selectNode(n) {
     });
   }
 
+  // Arjun-discovered params for this node
+  const nodeArjun = Object.entries(D.arjunParams||{}).filter(([url]) => {
+    try {
+      const p = new URL(url).pathname.replace(/^\/|\/$/g, '');
+      return (n._depth > 0) && (p === n.path || p === n.name || n.path.endsWith('/' + p));
+    } catch(e) { return false; }
+  });
+  if (nodeArjun.length) {
+    html += '<h3>Discovered Parameters <span class="src-badge src-arjun">arjun</span></h3>';
+    nodeArjun.forEach(([url, params]) => {
+      const fullUrl = url + '?' + params.map(p => p + '=').join('&');
+      html += `<div class="panel-url"><a href="${fullUrl}" target="_blank">${fullUrl}</a></div>`;
+    });
+  }
+
+  // Arjun summary on root node
+  if (n._depth === 0 && Object.keys(D.arjunParams||{}).length) {
+    html += '<h3>Discovered Parameters <span class="src-badge src-arjun">arjun</span></h3>';
+    Object.entries(D.arjunParams).forEach(([url, params]) => {
+      const fullUrl = url + '?' + params.map(p => p + '=').join('&');
+      html += `<div class="panel-url" style="margin-top:4px"><a href="${fullUrl}" target="_blank">${fullUrl}</a></div>`;
+    });
+  }
+
   // Child screenshots (if this is a folder node)
   if (n.children && n.children.length) {
     const childUrls = [];
@@ -1249,9 +1499,45 @@ function collapseAll() {
   cl(D.tree,0); render(true);
 }
 
+// Filter buttons
+let activeFilter = null;
+function toggleFilter(type) {
+  const btn = document.getElementById('btn-' + type);
+  if (activeFilter === type) {
+    activeFilter = null;
+    btn.classList.remove('active-' + type);
+    document.getElementById('search').value = '';
+    searchActive = false;
+    function clearAll(n) { n._collapsed = n._depth > 1; n._searchMatch = false; (n.children||[]).forEach(c => clearAll(c)); }
+    clearAll(D.tree);
+    render(true);
+    return;
+  }
+  if (activeFilter) document.getElementById('btn-' + activeFilter).classList.remove('active-' + activeFilter);
+  activeFilter = type;
+  btn.classList.add('active-' + type);
+  document.getElementById('search').value = '';
+  searchActive = true;
+  function clearN(n) { n._collapsed = true; n._searchMatch = false; (n.children||[]).forEach(c => clearN(c)); }
+  clearN(D.tree);
+  function markFilter(n) {
+    const match = type === 'params' ? n._hasParam : n._hasVuln;
+    if (match) n._searchMatch = true;
+    let childMatch = false;
+    if (n.children) n.children.forEach(c => { if (markFilter(c)) childMatch = true; });
+    if (childMatch) { n._collapsed = false; n._searchMatch = true; }
+    if (match && n._hasChildren) n._collapsed = false;
+    return match || childMatch;
+  }
+  markFilter(D.tree);
+  D.tree._collapsed = false;
+  render(true);
+}
+
 // Search
 let searchActive = false;
 document.getElementById('search').addEventListener('input', function() {
+  if (activeFilter) { document.getElementById('btn-' + activeFilter).classList.remove('active-' + activeFilter); activeFilter = null; }
   const q = this.value.toLowerCase();
   function clearSearch(n) { n._collapsed = true; n._searchMatch = false; (n.children||[]).forEach(c => clearSearch(c)); }
   clearSearch(D.tree);
@@ -1293,6 +1579,11 @@ selectNode(D.tree);
 </body>
 </html>'''
 
+# Neutralize markup/JS breakouts from attacker-controlled target strings
+# (page titles, tech banners, crawled URLs). The JS string parser decodes the
+# \uXXXX escapes back to the real characters, so displayed values are unchanged.
+data = (data.replace('<', '\\u003c').replace('>', '\\u003e')
+            .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
 html = HTML.replace('__REPORT_DATA__', data, 1)
 with open(REPORT, 'w') as f:
     f.write(html)
