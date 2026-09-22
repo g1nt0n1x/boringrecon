@@ -121,7 +121,14 @@ while getopts "qdhH:" opt; do
                     fi
                 done < "$OPTARG"
             else
-                HEADERS+=("$OPTARG")
+               # Same normalization as file input: a bare "name=value" (no
+               # "Header: value" separator) is a cookie. ffuf hard-fails on a
+               # header without a ": " separator, so we must fix it up here.
+               if [[ "$OPTARG" != *": "* ]]; then
+                   HEADERS+=("Cookie: $OPTARG")
+               else
+                   HEADERS+=("$OPTARG")
+               fi
             fi
             ;;
         *) usage ;;
