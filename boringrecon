@@ -49,10 +49,46 @@ usage() {
     exit 1
 }
 
-log() { echo -e "${GREEN}[+]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[!]${RESET} $1"; }
-err() { echo -e "${RED}[-]${RESET} $1"; }
-info() { echo -e "${BLUE}[*]${RESET} $1"; }
+_ts()  { date +"%H:%M:%S"; }
+log()  { echo -e "${GREEN}[+]${RESET} $(_ts) $*"; }
+warn() { echo -e "${YELLOW}[!]${RESET} $(_ts) $*"; }
+err()  { echo -e "${RED}[-]${RESET} $(_ts) $*"; }
+info() { echo -e "${BLUE}[*]${RESET} $(_ts) $*"; }
+ok()   { echo -e "${CYAN}[✓]${RESET} $(_ts) $*"; }
+
+# Phase timing — each _phase() call auto-closes the previous one with elapsed.
+_PS=0
+_SCAN_START=$(date +%s)
+_phase() {
+    [ "$_PS" -gt 0 ] && ok "Phase done ($(( $(date +%s) - _PS ))s)"
+    _PS=$(date +%s)
+    log "$*"
+}
+
+# Background job tracking — call _track "label" right after &, then _wait_jobs.
+declare -A _JOBS
+_track() { _JOBS[$!]="$1"; }
+_wait_jobs() {
+    local _pids=() _p _still
+    for _p in "${!_JOBS[@]}"; do _pids+=("$_p"); done
+    [ ${#_pids[@]} -eq 0 ] && return
+    local _names=()
+    for _p in "${_pids[@]}"; do _names+=("${_JOBS[$_p]}"); done
+    info "Running: $(IFS=', '; echo "${_names[*]}")"
+    while [ ${#_pids[@]} -gt 0 ]; do
+        wait -n "${_pids[@]}" 2>/dev/null
+        _still=()
+        for _p in "${_pids[@]}"; do
+            if kill -0 "$_p" 2>/dev/null; then
+                _still+=("$_p")
+            else
+                ok "  ${_JOBS[$_p]}"
+                unset "_JOBS[$_p]"
+            fi
+        done
+        _pids=( "${_still[@]}" )
+    done
+}
 
 check_tool() {
     if ! command -v "$1" &>/dev/null; then
@@ -76,9 +112,18 @@ run_nuclei() {     # $1 = list file; findings to stdout
     nuclei -l "$1" -silent -severity low,medium,high,critical \
         "${NUCLEI_HEADERS[@]}" 2>/dev/null
 }
+CHROME_BIN=$(command -v chromium chromium-browser google-chrome google-chrome-stable 2>/dev/null | head -1)
 run_gowitness() {  # $1 = list file of URLs
-    gowitness scan file -f "$1" --screenshot-path "$BASE/screenshots" \
-        --write-db=false "${GOWITNESS_HEADERS[@]}" 2>/dev/null
+    local _n _hard _chrome_arg
+    _n=$(wc -l < "$1" 2>/dev/null || echo 1)
+    _hard=$(( (_n + 1) * 20 ))
+    [ "$_hard" -lt 60 ] && _hard=60
+    # Without --chrome-path gowitness downloads its own Chrome binary, which
+    # hangs the pipeline when there is no/slow internet. Use the system binary.
+    _chrome_arg=()
+    [ -n "$CHROME_BIN" ] && _chrome_arg=(--chrome-path "$CHROME_BIN")
+    timeout "$_hard" gowitness scan file -f "$1" --screenshot-path "$BASE/screenshots" \
+        --write-db=false -T 15 "${_chrome_arg[@]}" "${GOWITNESS_HEADERS[@]}" 2>/dev/null || true
 }
 run_ferox() {      # $1 = list of URLs, $2 = output file; one feroxbuster per URL, in parallel
     : > "$2"
@@ -111,7 +156,9 @@ while getopts "qdhH:" opt; do
         h) usage ;;
         H)
             if [ -f "$OPTARG" ]; then
-                while IFS= read -r line; do
+                # `|| [ -n "$line" ]` processes a final line with no trailing
+                # newline (common for cookie dumps); a plain `while read` drops it.
+                while IFS= read -r line || [ -n "$line" ]; do
                     [ -z "$line" ] || [[ "$line" =~ ^# ]] && continue
                     # Lines without "Name: value" format are raw cookie values
                     if [[ "$line" != *": "* ]]; then
@@ -121,14 +168,14 @@ while getopts "qdhH:" opt; do
                     fi
                 done < "$OPTARG"
             else
-               # Same normalization as file input: a bare "name=value" (no
-               # "Header: value" separator) is a cookie. ffuf hard-fails on a
-               # header without a ": " separator, so we must fix it up here.
-               if [[ "$OPTARG" != *": "* ]]; then
-                   HEADERS+=("Cookie: $OPTARG")
-               else
-                   HEADERS+=("$OPTARG")
-               fi
+                # Same normalization as file input: a bare "name=value" (no
+                # "Header: value" separator) is a cookie. ffuf hard-fails on a
+                # header without a ": " separator, so we must fix it up here.
+                if [[ "$OPTARG" != *": "* ]]; then
+                    HEADERS+=("Cookie: $OPTARG")
+                else
+                    HEADERS+=("$OPTARG")
+                fi
             fi
             ;;
         *) usage ;;
@@ -199,14 +246,14 @@ if $URL_MODE; then
     echo "$TARGET_URL" > "$ALIVE"
     echo "$NMAP_TARGET" > "$SUBS_CLEAN"
 
-    log "Phase $PHASE: Fingerprinting target"
+    _phase "Phase $PHASE: Fingerprinting target"
     if check_tool httpx; then
         run_httpx "$ALIVE" > "$HTTPX_FULL"
     fi
 elif $QUICK; then
     echo "$DOMAIN" > "$SUBS_CLEAN"
 
-    log "Phase $PHASE: Fingerprinting target (quick — skipping subdomain enum)"
+    _phase "Phase $PHASE: Fingerprinting target (quick — skipping subdomain enum)"
     if check_tool httpx; then
         run_httpx "$SUBS_CLEAN" > "$HTTPX_FULL"
         awk '{print $1}' "$HTTPX_FULL" > "$ALIVE"
@@ -218,23 +265,22 @@ else
     > "$SUBS_RAW"
 
     if $DEEP; then
-        log "Phase $PHASE: Subdomain Enumeration (deep)"
+        _phase "Phase $PHASE: Subdomain Enumeration (deep)"
         if check_tool subfinder; then
-            info "Running subfinder..."
             subfinder -d "$DOMAIN" -silent >> "$SUBS_RAW" &
+            _track "subfinder"
         fi
         if check_tool assetfinder; then
-            info "Running assetfinder..."
             assetfinder --subs-only "$DOMAIN" >> "$SUBS_RAW" &
+            _track "assetfinder"
         fi
-        wait
-        log "Subdomain enumeration complete"
+        _wait_jobs
     else
-        log "Phase $PHASE: Fingerprinting target"
+        _phase "Phase $PHASE: Fingerprinting target"
     fi
 
     ((PHASE++))
-    log "Phase $PHASE: Deduplication"
+    _phase "Phase $PHASE: Deduplication"
 
     # Suffix-anchored: keep only the domain itself and true subdomains
     # (rejects lookalikes such as example.com.evil.com or notexample.com).
@@ -252,7 +298,7 @@ else
     fi
 
     ((PHASE++))
-    log "Phase $PHASE: Alive check & fingerprinting with httpx"
+    _phase "Phase $PHASE: Alive check & fingerprinting with httpx"
 
     if check_tool httpx; then
         run_httpx "$SUBS_CLEAN" > "$HTTPX_FULL"
@@ -275,19 +321,41 @@ fi
 # Scanning phase (parallel)
 # ============================================================
 ((PHASE++))
-log "Phase $PHASE: Scanning (parallel)"
+_phase "Phase $PHASE: Scanning (parallel)"
+
+# Detect katana once so the warning (if any) prints a single time regardless of
+# whether we crawl before or during the parallel block.
+KATANA_OK=false; check_tool katana && KATANA_OK=true
+
+# --- Crawl with Katana (authenticated targets: run FIRST, uncontended) ---
+# Streaming server-rendered apps (e.g. Blazor SSR) send the page shell first and
+# stream the nav/links in a later chunk. When katana runs inside the parallel
+# phase, contention for CPU and target bandwidth (nmap + nuclei + ffuf + gowitness
+# all hammering the same authenticated host) makes it parse the shell before the
+# links arrive, yielding ~1 URL instead of the full crawl — reproducible under
+# load, never in isolation. So when custom headers are set (the auth case where
+# crawl fidelity matters most), crawl first with the target to ourselves, then
+# parallelize everything else. See notes/katana-auth-crawl-investigation.md.
+KATANA_CRAWLED=false
+if $KATANA_OK && [ ${#HEADERS[@]} -gt 0 ]; then
+    info "Crawling with katana (auth mode — running uncontended before parallel scans)..."
+    run_katana "$ALIVE" 3 all > "$BASE/crawl/katana_urls.txt"
+    KATANA_CRAWLED=true
+    [ -s "$BASE/crawl/katana_urls.txt" ] && ok "katana → $(wc -l < "$BASE/crawl/katana_urls.txt") URLs"
+fi
 
 # --- Subdomain Takeover Check (domain mode only) ---
 if ! $URL_MODE && check_tool subzy; then
-    info "Checking subdomain takeover..."
     subzy run --targets "$SUBS_CLEAN" --hide_fails \
         > "$BASE/subdomains/takeover.txt" 2>/dev/null &
+    _track "subzy (takeover)"
 fi
 
 # --- Screenshots (root/alive only — subfolder screenshots happen after crawl) ---
 if check_tool gowitness; then
     info "Taking screenshots..."
     run_gowitness "$ALIVE" &
+    _track "gowitness (screenshots)"
 fi
 
 # --- Port Scan (use hostname, not URL) ---
@@ -304,18 +372,21 @@ if check_tool nmap; then
         nmap -T4 -sC -sV "${NMAP_PORTS[@]}" -oN "$BASE/scans/nmap_full.txt" \
             -iL "$SUBS_CLEAN" > /dev/null 2>&1 &
     fi
+    _track "nmap (port scan)"
 fi
 
-# --- Crawl with Katana ---
-if check_tool katana; then
+# --- Crawl with Katana (unauthenticated targets: safe to run in parallel) ---
+if $KATANA_OK && ! $KATANA_CRAWLED; then
     info "Crawling with katana..."
     run_katana "$ALIVE" 3 all > "$BASE/crawl/katana_urls.txt" &
+    _track "katana (crawl)"
 fi
 
 # --- Nuclei ---
 if ! $QUICK && check_tool nuclei; then
     info "Running nuclei..."
     run_nuclei "$ALIVE" > "$BASE/scans/nuclei.txt" &
+    _track "nuclei (vuln scan)"
 fi
 
 # --- Vhost Enumeration with ffuf ---
@@ -346,18 +417,24 @@ if ! $QUICK && check_tool ffuf; then
             "${FFUF_HEADERS[@]}" \
             -o "$BASE/scans/vhosts.json" \
             -of json 2>/dev/null &
+        _track "ffuf (vhost enum)"
     else
         warn "Vhost wordlist not found: $VHOST_WL"
     fi
 fi
 
-info "Waiting for scans to complete..."
-wait
+_wait_jobs
+# Brief result summaries from the parallel phase. Skip katana here if it already
+# ran (and reported) in the uncontended auth pass above, to avoid a double line.
+$KATANA_CRAWLED || { [ -s "$BASE/crawl/katana_urls.txt" ] && ok "katana → $(wc -l < "$BASE/crawl/katana_urls.txt") URLs"; }
+_nf="$BASE/scans/nmap_full.txt"; [ -s "$_nf" ] || _nf="$BASE/scans/nmap_quick.txt"
+[ -s "$_nf" ] && ok "nmap → $(grep -c "/tcp.*open" "$_nf" 2>/dev/null || echo 0) open port(s)"
+{ _nc=$(wc -l < "$BASE/scans/nuclei.txt" 2>/dev/null || echo 0); [ "$_nc" -gt 0 ] && ok "nuclei → $_nc finding(s)"; } || true
 
 # --- Directory brute-force with feroxbuster ---
 if check_tool feroxbuster; then
     ((PHASE++))
-    log "Phase $PHASE: Directory brute-force with feroxbuster"
+    _phase "Phase $PHASE: Directory brute-force with feroxbuster"
     FEROX_OUT="$BASE/scans/feroxbuster.txt"
     if $QUICK; then
         FEROX_WL="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
@@ -408,30 +485,43 @@ if ! $QUICK && [ -n "${VHOST_HOST:-}" ] && [ -f "$BASE/scans/vhosts.json" ] && c
         sort -u -o "$SUBS_CLEAN" "$SUBS_CLEAN"
 
         ((PHASE++))
-        log "Phase $PHASE: Scanning discovered vhosts"
+        _phase "Phase $PHASE: Scanning discovered vhosts"
 
         VHOST_ALIVE="$BASE/subdomains/vhosts_alive.txt"
         while read -r vh; do
             echo "${VHOST_SCHEME}://${vh}${VHOST_PORT:+:$VHOST_PORT}"
         done < "$BASE/subdomains/vhosts.txt" > "$VHOST_ALIVE"
 
+        # Same as the primary crawl: authenticated streaming-SSR vhosts lose
+        # their links under parallel contention, so crawl them first, uncontended.
+        VHOST_KATANA_CRAWLED=false
+        if $KATANA_OK && [ ${#HEADERS[@]} -gt 0 ]; then
+            info "Crawling vhosts with katana (auth mode — uncontended)..."
+            run_katana "$VHOST_ALIVE" 3 all > "$BASE/crawl/vhost_urls.txt"
+            VHOST_KATANA_CRAWLED=true
+        fi
+
         if check_tool httpx; then
             run_httpx "$VHOST_ALIVE" >> "$HTTPX_FULL" &
+            _track "httpx (vhost fingerprint)"
         fi
-        if check_tool katana; then
+        if $KATANA_OK && ! $VHOST_KATANA_CRAWLED; then
             info "Crawling vhosts..."
             run_katana "$VHOST_ALIVE" 3 all > "$BASE/crawl/vhost_urls.txt" &
+            _track "katana (vhost crawl)"
         fi
         if check_tool nuclei; then
             info "Scanning vhosts with nuclei..."
             run_nuclei "$VHOST_ALIVE" >> "$BASE/scans/nuclei.txt" &
+            _track "nuclei (vhost scan)"
         fi
         if check_tool gowitness; then
             info "Screenshotting vhosts..."
             run_gowitness "$VHOST_ALIVE" &
+            _track "gowitness (vhost screenshots)"
         fi
-        info "Waiting for vhost scans..."
-        wait
+        _wait_jobs
+        [ -s "$BASE/crawl/vhost_urls.txt" ] && ok "vhost crawl → $(wc -l < "$BASE/crawl/vhost_urls.txt") URLs"
 
         # Feroxbuster on vhosts
         if check_tool feroxbuster && [ -f "$FEROX_WL" ]; then
@@ -467,22 +557,46 @@ cat "$ALIVE" >> "$BASE/crawl/raw_endpoints.txt"
 # ============================================================
 if [ -s "$BASE/crawl/raw_endpoints.txt" ]; then
     ((PHASE++))
-    log "Phase $PHASE: Processing crawl results"
+    _phase "Phase $PHASE: Processing crawl results"
 
     # Build a HOST-anchored scope regex so only URLs whose host is in scope
     # survive. A plain substring match would admit example.com.evil.com etc.
     esc_re() { printf '%s' "$1" | sed 's/\./\\./g'; }
     if $URL_MODE; then
-        # Exact target host, plus any discovered vhost host
+        # Strict scope: host AND port must match the target (plus any vhost on
+        # the same port). Matching host-only would leak a different service on
+        # another port of the same host (e.g. localhost:5000 vs :6000).
+        TARGET_SCHEME=$(printf '%s' "$TARGET_URL" | grep -o '^https\?')
+        if [ -n "${NMAP_PORT:-}" ]; then
+            SCOPE_PORT="$NMAP_PORT"
+        elif [ "$TARGET_SCHEME" = https ]; then
+            SCOPE_PORT=443
+        else
+            SCOPE_PORT=80
+        fi
+
+        # Exact target host, plus any discovered vhost host (same port)
         SCOPE_HOSTS=("$NMAP_TARGET")
         if [ -s "$BASE/subdomains/vhosts.txt" ]; then
             while read -r vh; do [ -n "$vh" ] && SCOPE_HOSTS+=("$vh"); done \
                 < "$BASE/subdomains/vhosts.txt"
         fi
-        ALT=""; for h in "${SCOPE_HOSTS[@]}"; do ALT="${ALT:+$ALT|}$(esc_re "$h")"; done
+
+        # Per host require "host:PORT". When PORT is the scheme's default,
+        # also accept a bare "host" since URLs routinely omit the default port.
+        if { [ "$SCOPE_PORT" = 80 ] && [ "$TARGET_SCHEME" = http ]; } || \
+           { [ "$SCOPE_PORT" = 443 ] && [ "$TARGET_SCHEME" = https ]; }; then
+            PORT_PAT="(:${SCOPE_PORT})?"
+        else
+            PORT_PAT=":${SCOPE_PORT}"
+        fi
+        ALT=""; for h in "${SCOPE_HOSTS[@]}"; do
+            ALT="${ALT:+$ALT|}$(esc_re "$h")${PORT_PAT}"
+        done
         # Anchor at the scheme so the host is the real host, not a value
-        # embedded in a query string (e.g. ?next=http://in-scope).
-        SCOPE_RE="^https?://(${ALT})([:/]|\$)"
+        # embedded in a query string (e.g. ?next=http://in-scope). After the
+        # authority only a path/query/end may follow (port is matched above).
+        SCOPE_RE="^https?://(${ALT})(/|\?|\$)"
     else
         # The domain itself or any subdomain of it
         SCOPE_RE="^https?://([^/@:]*\.)?$(esc_re "$DOMAIN")([:/]|\$)"
@@ -527,7 +641,7 @@ if [ -s "$BASE/crawl/raw_endpoints.txt" ]; then
     # --- Parameter discovery with Arjun ---
     if check_tool arjun; then
         ((PHASE++))
-        log "Phase $PHASE: Parameter discovery with arjun (parallel)"
+        _phase "Phase $PHASE: Parameter discovery with arjun (parallel)"
 
         ARJUN_INPUT="$BASE/crawl/arjun_targets.txt"
         ARJUN_OUT="$BASE/crawl/arjun_params.json"
@@ -554,8 +668,9 @@ if [ -s "$BASE/crawl/raw_endpoints.txt" ]; then
                 [ -s "$batch" ] || continue
                 timeout 120 arjun -i "$batch" -oJ "${batch}.json" -t 10 -T 10 \
                     "${ARJUN_HEADERS[@]}" >/dev/null 2>&1 &
+                _track "arjun ($(basename "$batch"))"
             done
-            wait
+            _wait_jobs
         else
             warn "No arjun targets after filtering — skipping"
         fi
@@ -741,6 +856,10 @@ done
 # ============================================================
 # Summary
 # ============================================================
+[ "$_PS" -gt 0 ] && ok "Phase done ($(( $(date +%s) - _PS ))s)"
+_PS=0
+ok "Total elapsed: $(( $(date +%s) - _SCAN_START ))s"
+
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════${RESET}"
 echo -e "${CYAN}         BORING SUMMARY: $INPUT${RESET}"
@@ -863,6 +982,16 @@ if os.path.exists(arjun_file):
 # Build D3 tree: {name, children[], urls[], path}
 endpoints = read_lines(os.path.join(BASE, "crawl/endpoints.txt"))
 
+# Auto-flag "interesting" endpoints worth a closer look during enum.
+INTERESTING = ("admin","backup","config","console","debug","dev","internal",
+    "api","upload","secret","token",".sql",".bak",".old",".env",".git",
+    "swagger","graphql","actuator","phpinfo","staging","private","dump",
+    "creds","password","passwd","login","auth","adminer","phpmyadmin",
+    ".yml",".yaml",".json",".xml",".log",".zip",".tar",".conf")
+def is_interesting(u):
+    low = u.lower()
+    return any(k in low for k in INTERESTING)
+
 # Build URL → discovery source mapping
 url_sources = {}
 for src_file, label in [
@@ -897,7 +1026,8 @@ def build_d3_tree(urls, target, alive_hosts):
             if seg not in cur["children"]:
                 cur["children"][seg] = {"name":seg, "children":{}, "urls":[], "path":cp}
             cur = cur["children"][seg]
-        cur["urls"].append({"url":raw, "params":dict(parse_qs(parsed.query))})
+        cur["urls"].append({"url":raw, "params":dict(parse_qs(parsed.query)),
+            "interesting": is_interesting(raw)})
 
     if len(host_urls) > 1:
         for hk in sorted(host_urls):
@@ -947,7 +1077,7 @@ HTML = r'''<!DOCTYPE html>
 <title>Recon Map</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'SF Mono','Fira Code',Consolas,monospace;background:#fff;color:#1a1a1a;font-size:13px;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:#fff;color:#1a1a1a;font-size:13px;overflow:hidden;height:100vh;display:flex;flex-direction:column}
 #top-bar{display:flex;align-items:center;gap:16px;padding:8px 16px;border-bottom:1px solid #e0e0e0;flex-shrink:0;background:#fafafa}
 #top-bar h1{font-size:1.1em;white-space:nowrap}
 .stat{background:#f1f5f9;border:1px solid #e0e0e0;border-radius:6px;padding:4px 12px;font-size:0.85em;white-space:nowrap}
@@ -970,7 +1100,7 @@ svg{display:block}
 .node.has-param circle{fill:#fefce8;stroke:#facc15;stroke-width:2.5px}
 .node.has-vuln circle{fill:#fef2f2;stroke:#f87171;stroke-width:2.5px}
 .node.selected circle{fill:#dbeafe;stroke:#2563eb;stroke-width:3px}
-.node text{font:11px 'SF Mono','Fira Code',Consolas,monospace;fill:#334155;pointer-events:none}
+.node text{font:11px system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;fill:#334155;pointer-events:none}
 .node .count{font-size:9px;fill:#94a3b8}
 .node .indicator{font-size:10px;fill:#94a3b8;pointer-events:none}
 .node:hover .indicator{fill:#2563eb}
@@ -995,6 +1125,8 @@ svg{display:block}
 #controls{position:absolute;bottom:16px;right:16px;display:flex;gap:6px;z-index:10}
 #controls button{background:#fff;border:1px solid #e0e0e0;border-radius:6px;width:32px;height:32px;cursor:pointer;font-size:1.1em;display:flex;align-items:center;justify-content:center}
 #controls button:hover{background:#f1f5f9;border-color:#94a3b8}
+#controls button.rf-unread{background:#fef3c7;border-color:#fcd34d;color:#92400e}
+#controls button.rf-read{background:#dcfce7;border-color:#22c55e;color:#166534}
 #search-box{position:absolute;top:12px;left:12px;z-index:10}
 #search-box input{padding:6px 10px;border:1px solid #e0e0e0;border-radius:6px;font-family:inherit;font-size:0.9em;width:220px;background:#fff}
 #search-box input:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,0.15)}
@@ -1010,6 +1142,21 @@ svg{display:block}
 .filter-btn:hover{background:#f1f5f9;border-color:#94a3b8}
 .filter-btn.active-params{background:#fef3c7;border-color:#fcd34d;font-weight:600}
 .filter-btn.active-vulns{background:#fef2f2;border-color:#fca5a5;font-weight:600}
+.filter-btn.active-unread{background:#f0fdf4;border-color:#86efac;font-weight:600}
+.node.read circle{fill:#f0fdf4;stroke:#86efac}
+.node.read text{fill:#94a3b8}
+.node .readmark{font:11px system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;fill:#16a34a;font-weight:700;pointer-events:none}
+.read-btn{display:inline-block;padding:6px 12px;border-radius:6px;border:1px solid #86efac;background:#f0fdf4;color:#166534;font-family:inherit;font-size:0.85em;cursor:pointer;font-weight:600;margin-bottom:8px}
+.read-btn.is-read{background:#dcfce7;border-color:#22c55e}
+.read-btn:hover{filter:brightness(0.97)}
+.read-note{font-size:0.8em;color:#16a34a;margin:0 0 10px}
+.stat.done b{color:#16a34a}
+.node .star{font:10px system-ui,sans-serif;fill:#d97706;cursor:help}
+.node.interesting circle{stroke:#d97706}
+.filter-btn.active-interesting{background:#fffbeb;border-color:#fcd34d;font-weight:600}
+.copy-btn{display:inline-block;padding:3px 9px;border-radius:5px;border:1px solid #cbd5e1;background:#f8fafc;color:#334155;font-family:inherit;font-size:0.78em;cursor:pointer;margin:2px 4px 2px 0}
+.copy-btn:hover{background:#eef2f7}
+.copy-btn.copied{background:#dcfce7;border-color:#22c55e;color:#166534}
 </style>
 </head>
 <body>
@@ -1020,7 +1167,7 @@ svg{display:block}
 </div>
 <div id="main">
   <div id="canvas-wrap">
-    <div id="search-box"><input type="text" id="search" placeholder="Search endpoints..."><button class="filter-btn" id="btn-params" onclick="toggleFilter('params')">Params</button><button class="filter-btn" id="btn-vulns" onclick="toggleFilter('vulns')">Vulns</button></div>
+    <div id="search-box"><input type="text" id="search" placeholder="Search endpoints..."><button class="filter-btn" id="btn-params" onclick="toggleFilter('params')">Params</button><button class="filter-btn" id="btn-vulns" onclick="toggleFilter('vulns')">Vulns</button><button class="filter-btn" id="btn-interesting" onclick="toggleFilter('interesting')" title="Endpoints matching high-signal keywords (admin, config, .env, backup, ...)">★ Interesting</button></div>
     <div id="canvas"></div>
     <div id="controls">
       <button onclick="zoomBy(1.3)" title="Zoom in">+</button>
@@ -1028,6 +1175,7 @@ svg{display:block}
       <button onclick="resetView()" title="Reset view">R</button>
       <button onclick="expandAll()" title="Expand all">E</button>
       <button onclick="collapseAll()" title="Collapse all">C</button>
+      <button onclick="cycleReadFilter()" id="btn-readfilter" title="Filter reviewed: show unreviewed only">✓</button>
     </div>
   </div>
   <div id="panel">
@@ -1052,6 +1200,7 @@ statsHtml += `<span class="stat"><b>${D.endpointCount}</b>endpoints</span>`;
 statsHtml += `<span class="stat"><b>${tp}</b>ports</span>`;
 statsHtml += `<span class="stat"><b>${D.paramNames.length}</b>params</span>`;
 if (D.vulns.length) statsHtml += `<span class="stat vuln"><b>${D.vulns.length}</b>vulns</span>`;
+statsHtml += `<span class="stat done" id="stat-read" title="Nodes you have marked as reviewed"><b>0</b>reviewed</span>`;
 document.getElementById('stats').innerHTML = statsHtml;
 // Build per-host httpx lookup
 const hostInfo = {};
@@ -1086,6 +1235,13 @@ Object.keys(D.arjunParams||{}).forEach(url => {
   try { arjunPaths.add(new URL(url).pathname.replace(/^\/|\/$/g, '')); } catch(e) {}
 });
 
+const INTERESTING_KW = ["admin","backup","config","console","debug","dev","internal",
+  "api","upload","secret","token",".sql",".bak",".old",".env",".git","swagger",
+  "graphql","actuator","phpinfo","staging","private","dump","creds","password",
+  "passwd","login","auth","adminer","phpmyadmin",".yml",".yaml",".json",".xml",
+  ".log",".zip",".tar",".conf"];
+function nameInteresting(s) { s = (s||'').toLowerCase(); return INTERESTING_KW.some(k => s.includes(k)); }
+
 function initNode(d, parent, depth) {
   d._id = nextId++;
   d._depth = depth;
@@ -1095,10 +1251,51 @@ function initNode(d, parent, depth) {
   d._hasChildren = d.children && d.children.length > 0;
   d._hasParam = (d.urls||[]).some(u => Object.keys(u.params||{}).length > 0) || arjunPaths.has(d.path) || arjunPaths.has(d.name);
   d._hasVuln = D.vulns.some(v => v.url.includes('/' + d.path));
+  const urls = d.urls || [];
+  d._interesting = (depth > 0) && (urls.some(u => u.interesting) || nameInteresting(d.name));
   nodeMap[d._id] = d;
   if (d.children) d.children.forEach(c => initNode(c, d, depth + 1));
 }
 initNode(D.tree, null, 0);
+
+// ---- "Mark as reviewed" state (persisted in localStorage) ----------------
+// readSet holds the paths of explicitly-marked nodes. A node counts as read
+// if it OR any ancestor is marked, so marking a parent cascades to every
+// child. Keyed per-target so multiple reports don't clash.
+const READ_KEY = 'boringrecon:read:' + D.target;
+let readSet = new Set();
+try { readSet = new Set(JSON.parse(localStorage.getItem(READ_KEY) || '[]')); } catch(e) {}
+function saveRead() { try { localStorage.setItem(READ_KEY, JSON.stringify([...readSet])); } catch(e) {} }
+
+function isRead(n) { let c = n; while (c) { if (readSet.has(c.path)) return true; c = c._parent; } return false; }
+function isReadHere(n) { return readSet.has(n.path); }
+function countNodes(n) { let c = 1; (n.children||[]).forEach(ch => c += countNodes(ch)); return c; }
+function purgeDesc(n) { (n.children||[]).forEach(c => { readSet.delete(c.path); purgeDesc(c); }); }
+
+function setRead(n) { readSet.add(n.path); purgeDesc(n); saveRead(); }
+function setUnread(n) {
+  // Explicitly marked here → just remove it (and any redundant descendants).
+  if (readSet.has(n.path)) { readSet.delete(n.path); purgeDesc(n); saveRead(); return; }
+  // Otherwise it's read via an ancestor: "split" that coverage so only this
+  // node's branch becomes unread while its siblings stay reviewed.
+  const chain = []; let cur = n._parent, prev = n, anc = null;
+  while (cur) { chain.push([cur, prev]); if (readSet.has(cur.path)) { anc = cur; break; } prev = cur; cur = cur._parent; }
+  if (anc) {
+    readSet.delete(anc.path);
+    for (const [node, childOnPath] of chain) {
+      (node.children||[]).forEach(c => { if (c !== childOnPath) readSet.add(c.path); });
+    }
+  }
+  purgeDesc(n); saveRead();
+}
+function toggleRead(n) { if (isRead(n)) setUnread(n); else setRead(n); if (readFilterState !== 0) applyReadFilter(); render(true); selectNode(n); updateReadStat(); }
+function clearAllRead() { readSet.clear(); saveRead(); if (readFilterState !== 0) applyReadFilter(); render(true); if (selectedNode) selectNode(selectedNode); updateReadStat(); }
+
+function readCount() { let c = 0; (function w(n){ if (isRead(n)) c++; (n.children||[]).forEach(w); })(D.tree); return c; }
+function updateReadStat() {
+  const el = document.getElementById('stat-read');
+  if (el) el.innerHTML = `<b>${readCount()}</b>reviewed`;
+}
 
 function getVisible(node) {
   let nodes = [node];
@@ -1177,6 +1374,8 @@ function render(animate) {
     if (n._hasChildren) cls += ' has-children';
     if (n._hasParam) cls += ' has-param';
     if (n._hasVuln) cls += ' has-vuln';
+    if (n._interesting) cls += ' interesting';
+    if (isRead(n)) cls += ' read';
     if (selectedNode && selectedNode._id === n._id) cls += ' selected';
     ng.setAttribute('class', cls);
     ng.style.opacity = (searchActive && !n._searchMatch) ? '0.12' : '1';
@@ -1202,6 +1401,15 @@ function render(animate) {
     circle.setAttribute('r', r);
     ng.appendChild(circle);
 
+    if (isRead(n)) {
+      const chk = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      chk.setAttribute('class', 'readmark');
+      chk.setAttribute('x', -3.5);
+      chk.setAttribute('y', 4);
+      chk.textContent = '✓';
+      ng.appendChild(chk);
+    }
+
     const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
     text.setAttribute('x', r + 6);
     text.setAttribute('y', 4);
@@ -1214,10 +1422,24 @@ function render(animate) {
     title.textContent = n._depth === 0 ? n.name : '/' + n.path;
     ng.appendChild(title);
 
+    // Trailing annotations: ★ (count) — laid out left→right.
+    let ax = r + 6 + label.length * 6.5 + 6;
+    if (n._interesting) {
+      const star = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      star.setAttribute('class', 'star');
+      star.setAttribute('x', ax);
+      star.setAttribute('y', 4.5);
+      star.textContent = '★';
+      const t2 = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      t2.textContent = 'Potentially interesting for enum';
+      star.appendChild(t2);
+      ng.appendChild(star);
+      ax += 12;
+    }
     if (n._hasChildren) {
       const cnt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
       cnt.setAttribute('class', 'count');
-      cnt.setAttribute('x', r + 6 + label.length * 6.5 + 4);
+      cnt.setAttribute('x', ax);
       cnt.setAttribute('y', 4);
       const total = countAll(n);
       cnt.textContent = n._collapsed ? `(+${total})` : `(${total})`;
@@ -1341,6 +1563,18 @@ function selectNode(n) {
 
   let html = '';
 
+  // --- Mark as reviewed ---
+  const rd = isRead(n);
+  const descendants = countNodes(n) - 1;
+  html += `<button class="read-btn ${rd ? 'is-read' : ''}" onclick="toggleRead(selectedNode)">`
+        + `${rd ? '✓ Reviewed — click to unmark' : 'Mark as reviewed'}</button>`;
+  if (n._depth === 0 && readSet.size)
+    html += `<button class="read-btn" style="border-color:#e0e0e0;background:#fff;color:#64748b;margin-left:6px" onclick="clearAllRead()">Clear all</button>`;
+  if (descendants > 0)
+    html += `<div class="read-note">${rd && !isReadHere(n) ? 'Reviewed via a parent. ' : ''}Marking this covers all ${descendants} item(s) below it.</div>`;
+  else if (rd && !isReadHere(n))
+    html += `<div class="read-note">Reviewed via a parent folder.</div>`;
+
   // Per-host tech stack & title (host nodes or root in single-host mode)
   const hostKey = n._depth === 0 ? (D.httpx[0]||{}).url : n.path;
   const hi = hostKey ? hostInfo[(() => { try { return new URL(hostKey).hostname; } catch(e) { return hostKey; } })()] : null;
@@ -1441,6 +1675,18 @@ function selectNode(n) {
     }
   }
 
+  // Copy-to-clipboard bundle (root node) — grab lists straight into a wordlist
+  // or Burp/ffuf without re-scraping the tree by hand.
+  if (n._depth === 0) {
+    html += '<h3>Copy</h3><div style="margin-bottom:6px">';
+    html += `<button class="copy-btn" onclick="copyToClip(this, allEndpointUrls)">Endpoints (${allEndpointUrls().length})</button>`;
+    if (D.paramsUrls && D.paramsUrls.length)
+      html += `<button class="copy-btn" onclick="copyToClip(this, D.paramsUrls)">Param URLs (${D.paramsUrls.length})</button>`;
+    if (D.jsFiles && D.jsFiles.length)
+      html += `<button class="copy-btn" onclick="copyToClip(this, D.jsFiles)">JS files (${D.jsFiles.length})</button>`;
+    html += '</div>';
+  }
+
   // Params
   if (n._depth === 0 && D.paramNames.length) {
     html += '<h3>Parameters</h3>';
@@ -1497,6 +1743,35 @@ wrap.addEventListener('wheel', (e) => {
   zoomBy(e.deltaY < 0 ? 1.1 : 0.9);
 }, { passive: false });
 
+// Collect every endpoint URL in the tree (deduped, sorted).
+function allEndpointUrls() {
+  const out = [];
+  (function w(n){ (n.urls||[]).forEach(u => out.push(u.url)); (n.children||[]).forEach(w); })(D.tree);
+  return [...new Set(out)].sort();
+}
+// Copy a list/string to the clipboard with a visual "Copied" confirmation.
+// Falls back to a hidden textarea when navigator.clipboard is unavailable
+// (e.g. some browsers block it on file:// origins).
+function copyToClip(btn, src) {
+  let val = (typeof src === 'function') ? src() : src;
+  if (Array.isArray(val)) val = val.join('\n');
+  const done = () => {
+    const orig = btn.dataset.label || btn.textContent;
+    btn.dataset.label = orig; btn.classList.add('copied'); btn.textContent = '✓ Copied';
+    setTimeout(() => { btn.classList.remove('copied'); btn.textContent = orig; }, 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(val).then(done).catch(() => fallbackCopy(val, done));
+  } else { fallbackCopy(val, done); }
+}
+function fallbackCopy(val, done) {
+  const ta = document.createElement('textarea');
+  ta.value = val; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch(e) {}
+  document.body.removeChild(ta);
+}
+
 function expandAll() {
   function ex(n) { n._collapsed = false; if(n.children) n.children.forEach(ex); }
   ex(D.tree); render(true);
@@ -1506,9 +1781,56 @@ function collapseAll() {
   cl(D.tree,0); render(true);
 }
 
+// Reviewed filter (tri-state control below the zoom buttons):
+//   0 = show all  →  1 = only unreviewed  →  2 = only reviewed  →  back to 0
+let readFilterState = 0;
+function resetReadFilterBtn() {
+  readFilterState = 0;
+  const b = document.getElementById('btn-readfilter');
+  if (b) { b.classList.remove('rf-unread', 'rf-read'); b.textContent = '✓'; b.title = 'Filter reviewed: show unreviewed only'; }
+}
+function applyReadFilter() {
+  const btn = document.getElementById('btn-readfilter');
+  (function clr(n){ n._searchMatch = false; (n.children||[]).forEach(clr); })(D.tree);
+  if (readFilterState === 0) {
+    searchActive = false;
+    btn.classList.remove('rf-unread', 'rf-read'); btn.textContent = '✓';
+    btn.title = 'Filter reviewed: show unreviewed only';
+    (function reset(n){ n._collapsed = n._depth > 1; (n.children||[]).forEach(reset); })(D.tree);
+    return;
+  }
+  searchActive = true;
+  const wantRead = readFilterState === 2;
+  btn.classList.toggle('rf-read', wantRead);
+  btn.classList.toggle('rf-unread', !wantRead);
+  btn.textContent = wantRead ? '☑' : '☐';
+  btn.title = wantRead ? 'Showing reviewed only — click to reset'
+                       : 'Showing unreviewed only — click to show reviewed';
+  (function coll(n){ n._collapsed = true; (n.children||[]).forEach(coll); })(D.tree);
+  (function mark(n){
+    const match = wantRead ? isRead(n) : !isRead(n);
+    if (match) n._searchMatch = true;
+    let childMatch = false;
+    if (n.children) n.children.forEach(c => { if (mark(c)) childMatch = true; });
+    if (childMatch) { n._collapsed = false; n._searchMatch = true; }
+    if (match && n._hasChildren) n._collapsed = false;
+    return match || childMatch;
+  })(D.tree);
+  D.tree._collapsed = false;
+}
+function cycleReadFilter() {
+  // Mutually exclusive with the search-box filters and the search input.
+  if (activeFilter) { document.getElementById('btn-' + activeFilter).classList.remove('active-' + activeFilter); activeFilter = null; }
+  document.getElementById('search').value = '';
+  readFilterState = (readFilterState + 1) % 3;
+  applyReadFilter();
+  render(true);
+}
+
 // Filter buttons
 let activeFilter = null;
 function toggleFilter(type) {
+  resetReadFilterBtn();
   const btn = document.getElementById('btn-' + type);
   if (activeFilter === type) {
     activeFilter = null;
@@ -1528,7 +1850,7 @@ function toggleFilter(type) {
   function clearN(n) { n._collapsed = true; n._searchMatch = false; (n.children||[]).forEach(c => clearN(c)); }
   clearN(D.tree);
   function markFilter(n) {
-    const match = type === 'params' ? n._hasParam : n._hasVuln;
+    const match = type === 'params' ? n._hasParam : (type === 'interesting' ? n._interesting : n._hasVuln);
     if (match) n._searchMatch = true;
     let childMatch = false;
     if (n.children) n.children.forEach(c => { if (markFilter(c)) childMatch = true; });
@@ -1544,6 +1866,7 @@ function toggleFilter(type) {
 // Search
 let searchActive = false;
 document.getElementById('search').addEventListener('input', function() {
+  resetReadFilterBtn();
   if (activeFilter) { document.getElementById('btn-' + activeFilter).classList.remove('active-' + activeFilter); activeFilter = null; }
   const q = this.value.toLowerCase();
   function clearSearch(n) { n._collapsed = true; n._searchMatch = false; (n.children||[]).forEach(c => clearSearch(c)); }
@@ -1575,11 +1898,13 @@ document.getElementById('lightbox').addEventListener('click', function(e) {
 });
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') { document.getElementById('lightbox').classList.remove('show'); document.getElementById('panel').classList.remove('show'); }
+  if ((e.key === 'r' || e.key === 'R') && selectedNode && document.activeElement.id !== 'search') { toggleRead(selectedNode); }
 });
 
 // Init
 resetView();
 render(false);
+updateReadStat();
 // Auto-select root
 selectNode(D.tree);
 </script>
